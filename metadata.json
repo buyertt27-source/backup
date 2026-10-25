@@ -1,0 +1,6 @@
+{
+  "name": "PteroVault Backup Manager",
+  "description": "Manajemen pencadangan otomatis dan terpisah untuk server Pterodactyl menggunakan kredensial PLTA, PLTS/PLTC, dan Domain Panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
