@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { User } from 'firebase/auth';
 import {
   PteroServer,
   PteroCredentials,
@@ -14,9 +13,16 @@ import {
   calculateNextScheduleRun,
   selectBackupsToAutoDelete,
 } from './utils/backupLogic';
-import { initAuth, googleSignIn, getAccessToken, logoutGoogle } from './services/googleDriveAuth';
+import {
+  initAuth,
+  googleSignIn,
+  getAccessToken,
+  logoutGoogle,
+  GoogleDriveUser,
+} from './services/googleDriveAuth';
 import { uploadBackupToGoogleDrive } from './services/googleDriveService';
 import { ApiKeyConfigModal } from './components/ApiKeyConfigModal';
+import { GoogleDriveConfigModal } from './components/GoogleDriveConfigModal';
 import { ServerBackupCard } from './components/ServerBackupCard';
 import { AutoBackupSchedulerPanel } from './components/AutoBackupSchedulerPanel';
 import {
@@ -36,6 +42,7 @@ import {
   ExternalLink,
   LogOut,
   Trash2,
+  Settings,
 } from 'lucide-react';
 
 const STORAGE_KEYS = {
@@ -109,11 +116,13 @@ export function App() {
     return localStorage.getItem(STORAGE_KEYS.MANUAL_DRIVE_PREF) === 'true';
   });
 
-  // Google Drive OAuth state (in-memory token managed by googleDriveAuth)
-  const [googleUser, setGoogleUser] = useState<User | null>(null);
+  // Google Drive OAuth state (supports Firebase Popup, GIS Client ID, and Direct Token / Refresh Token for Vercel)
+  const [googleUser, setGoogleUser] = useState<GoogleDriveUser | null>(null);
   const [googleToken, setGoogleToken] = useState<string | null>(null);
   const [isSigningInGoogle, setIsSigningInGoogle] = useState<boolean>(false);
   const [uploadingDriveIds, setUploadingDriveIds] = useState<string[]>([]);
+  const [isDriveConfigModalOpen, setIsDriveConfigModalOpen] = useState<boolean>(false);
+  const [driveModalAutoReason, setDriveModalAutoReason] = useState<string | null>(null);
 
   // Explicit confirmation modal for destructive delete action
   const [pendingDelete, setPendingDelete] = useState<{
@@ -197,7 +206,8 @@ export function App() {
   }, []);
 
   /**
-   * Initiates Google Sign-In popup for Google Drive storage permission
+   * Initiates Google Sign-In popup for Google Drive storage permission,
+   * automatically opening the Vercel Google Drive Configuration modal if unauthorized-domain occurs on Vercel.
    */
   const handleGoogleLogin = useCallback(async () => {
     setIsSigningInGoogle(true);
@@ -215,7 +225,20 @@ export function App() {
         showNotice(`Terhubung ke Google Drive sebagai ${result.user.email || result.user.displayName}.`, 'success');
       }
     } catch (err: any) {
-      showNotice(`Gagal masuk dengan Google: ${err?.message || 'Popup ditutup'}`, 'error');
+      const msg = String(err?.message || '');
+      if (err?.code === 'VERCEL_DOMAIN_SETUP_REQUIRED' || msg.includes('unauthorized-domain') || msg.includes('OAuth')) {
+        setDriveModalAutoReason(
+          `Domain "${window.location.hostname}" belum terdaftar di Firebase Authorized Domains. Gunakan Tab 1 (Token Langsung) untuk langsung terhubung di Vercel tanpa whitelist domain, atau tambahkan domain "${window.location.hostname}" di Tab 3.`
+        );
+        setIsDriveConfigModalOpen(true);
+      } else {
+        showNotice(
+          `Gagal masuk dengan popup Google (${msg || 'Popup ditutup'}). Membuka opsi koneksi Google Drive untuk Vercel...`,
+          'info'
+        );
+        setDriveModalAutoReason(null);
+        setIsDriveConfigModalOpen(true);
+      }
     } finally {
       setIsSigningInGoogle(false);
     }
@@ -246,7 +269,10 @@ export function App() {
           setGoogleUser(signInRes.user);
           setGoogleToken(signInRes.accessToken);
         } catch (err: any) {
-          showNotice(`Login Google dibatalkan atau gagal: ${err?.message || 'Popup ditutup'}`, 'error');
+          setDriveModalAutoReason(
+            'Silakan hubungkan Google Drive Anda terlebih dahulu (mendukung Token Langsung & OAuth Client ID untuk Vercel).'
+          );
+          setIsDriveConfigModalOpen(true);
           return;
         }
       }
@@ -1215,38 +1241,55 @@ export function App() {
 
               {/* Official Google Sign-In Button or Connected Account Pill */}
               {!isDriveConnected ? (
-                <button
-                  type="button"
-                  disabled={isSigningInGoogle}
-                  onClick={handleGoogleLogin}
-                  className="px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-                >
-                  <svg
-                    version="1.1"
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 48 48"
-                    className="w-4 h-4 shrink-0"
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isSigningInGoogle}
+                    onClick={handleGoogleLogin}
+                    className="px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
                   >
-                    <path
-                      fill="#EA4335"
-                      d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                    />
-                    <path
-                      fill="#4285F4"
-                      d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                    />
-                    <path
-                      fill="#FBBC05"
-                      d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                    />
-                    <path
-                      fill="#34A853"
-                      d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                    />
-                    <path fill="none" d="M0 0h48v48H0z" />
-                  </svg>
-                  <span>{isSigningInGoogle ? 'Menghubungkan...' : 'Sign in with Google'}</span>
-                </button>
+                    <svg
+                      version="1.1"
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 48 48"
+                      className="w-4 h-4 shrink-0"
+                    >
+                      <path
+                        fill="#EA4335"
+                        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                      />
+                      <path
+                        fill="#4285F4"
+                        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                      />
+                      <path fill="none" d="M0 0h48v48H0z" />
+                    </svg>
+                    <span>{isSigningInGoogle ? 'Menghubungkan...' : 'Sign in with Google'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDriveModalAutoReason(null);
+                      setIsDriveConfigModalOpen(true);
+                    }}
+                    className={`px-3 py-2 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                      isDark
+                        ? 'border-red-500/40 bg-red-950/25 text-red-300 hover:bg-red-950/40'
+                        : 'border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100'
+                    }`}
+                  >
+                    <Settings className="w-3.5 h-3.5" />
+                    Opsi Login Google (Fix Vercel)
+                  </button>
+                </div>
               ) : (
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={`text-xs font-mono truncate max-w-[180px] ${isDark ? 'text-emerald-400' : 'text-emerald-700'}`}>
@@ -1278,6 +1321,22 @@ export function App() {
                       Lihat di Drive
                     </a>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDriveModalAutoReason(null);
+                      setIsDriveConfigModalOpen(true);
+                    }}
+                    aria-label="Pengaturan Google Drive Vercel"
+                    className={`px-2.5 py-1.5 rounded-lg border text-xs inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                      isDark
+                        ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+                    }`}
+                  >
+                    <Settings className="w-3.5 h-3.5" />
+                    Pengaturan Drive
+                  </button>
                   <button
                     type="button"
                     onClick={handleGoogleLogout}
@@ -1890,6 +1949,28 @@ export function App() {
           setSelectedServerIds([]);
           setQuickSingleServerId('');
           appendLog('Putuskan Kredensial API', 'Panel Pterodactyl', 'Kredensial dan daftar server real dibersihkan dari sesi web.', 'warning');
+        }}
+        theme={theme}
+      />
+
+      {/* Google Drive & Vercel Login Configuration Modal */}
+      <GoogleDriveConfigModal
+        isOpen={isDriveConfigModalOpen}
+        onClose={() => setIsDriveConfigModalOpen(false)}
+        autoOpenedReason={driveModalAutoReason}
+        onConnected={(user, token) => {
+          setGoogleUser(user);
+          setGoogleToken(token);
+          appendLog(
+            'Google Drive Terhubung (Mode Vercel/OAuth)',
+            user.email || 'Google Drive',
+            'Koneksi Google Drive berhasil diverifikasi dan siap menyimpan file backup.',
+            'success'
+          );
+          showNotice(
+            `Berhasil terhubung ke Google Drive sebagai ${user.email || user.displayName}!`,
+            'success'
+          );
         }}
         theme={theme}
       />
