@@ -12,6 +12,7 @@ import {
   formatBytes,
   calculateNextScheduleRun,
   selectBackupsToAutoDelete,
+  buildGoogleAppsScriptCode,
 } from './utils/backupLogic';
 import {
   initAuth,
@@ -19,6 +20,7 @@ import {
   getAccessToken,
   logoutGoogle,
   GoogleDriveUser,
+  connectWithAppsScriptBridge,
 } from './services/googleDriveAuth';
 import { uploadBackupToGoogleDrive } from './services/googleDriveService';
 import { ApiKeyConfigModal } from './components/ApiKeyConfigModal';
@@ -123,6 +125,9 @@ export function App() {
   const [uploadingDriveIds, setUploadingDriveIds] = useState<string[]>([]);
   const [isDriveConfigModalOpen, setIsDriveConfigModalOpen] = useState<boolean>(false);
   const [driveModalAutoReason, setDriveModalAutoReason] = useState<string | null>(null);
+  const [quickBridgeUrl, setQuickBridgeUrl] = useState<string>('');
+  const [quickFolderUrl, setQuickFolderUrl] = useState<string>('');
+  const [copiedQuickScript, setCopiedQuickScript] = useState<boolean>(false);
 
   // Explicit confirmation modal for destructive delete action
   const [pendingDelete, setPendingDelete] = useState<{
@@ -1175,108 +1180,213 @@ export function App() {
             </div>
           </div>
 
-          {/* Google Drive Storage Mode & Official Sign in with Google Bar */}
+          {/* Google Drive Storage Mode & Super Simple Quick-Connect Bar */}
           <div
-            className={`mt-5 p-4 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-4 transition-colors ${
+            className={`mt-5 p-4 rounded-xl border space-y-4 transition-colors ${
               isDark ? 'bg-[#09090B] border-[#242429]' : 'bg-slate-50 border-slate-200'
             }`}
           >
-            <div className="flex items-start gap-3 min-w-0 flex-1">
-              <CloudUpload className={`w-5 h-5 mt-0.5 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
-              <div className="min-w-0">
-                <div className="text-sm font-semibold">
-                  Pilihan Tujuan Penyimpanan File Backup (Panel Pterodactyl vs Google Drive)
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="flex items-start gap-3 min-w-0 flex-1">
+                <CloudUpload className={`w-5 h-5 mt-0.5 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold">
+                    Pilihan Tujuan Penyimpanan File Backup (Panel Pterodactyl vs Google Drive)
+                  </div>
+                  <p className={`text-xs mt-0.5 ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
+                    Pilih apakah backup disimpan di Panel saja atau ikut diunggah ke folder terpisah (<code className="font-mono">PteroVault_Backups/Server_01_...</code>) di Google Drive Anda.
+                  </p>
                 </div>
-                <p className={`text-xs mt-0.5 ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
-                  Pilih apakah backup disimpan di Panel saja atau ikut diunggah ke folder terpisah (<code className="font-mono">PteroVault_Backups/Server_01_...</code>) di Google Drive Anda.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 shrink-0">
-              {/* Storage Destination Toggle for Manual Backups */}
-              <div
-                className={`inline-flex p-1 rounded-lg border ${
-                  isDark ? 'bg-[#121215] border-[#27272A]' : 'bg-white border-slate-200'
-                }`}
-                role="group"
-                aria-label="Pilihan Simpan ke Google Drive"
-              >
-                <button
-                  type="button"
-                  onClick={() => setSaveManualToDrive(false)}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    !saveManualToDrive
-                      ? isDark
-                        ? 'bg-red-600 text-white'
-                        : 'bg-blue-600 text-white'
-                      : isDark
-                      ? 'text-zinc-400 hover:text-white'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Simpan di Panel Saja
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSaveManualToDrive(true);
-                    if (!isDriveConnected) {
-                      handleGoogleLogin();
-                    }
-                  }}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    saveManualToDrive
-                      ? isDark
-                        ? 'bg-red-600 text-white'
-                        : 'bg-blue-600 text-white'
-                      : isDark
-                      ? 'text-zinc-400 hover:text-white'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Simpan ke Panel + Google Drive
-                </button>
               </div>
 
-              {/* Official Google Sign-In Button or Connected Account Pill */}
-              {!isDriveConnected ? (
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-3 shrink-0">
+                {/* Storage Destination Toggle for Manual Backups */}
+                <div
+                  className={`inline-flex p-1 rounded-lg border ${
+                    isDark ? 'bg-[#121215] border-[#27272A]' : 'bg-white border-slate-200'
+                  }`}
+                  role="group"
+                  aria-label="Pilihan Simpan ke Google Drive"
+                >
                   <button
                     type="button"
-                    disabled={isSigningInGoogle}
-                    onClick={handleGoogleLogin}
-                    className="px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold inline-flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
+                    onClick={() => setSaveManualToDrive(false)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      !saveManualToDrive
+                        ? isDark
+                          ? 'bg-red-600 text-white'
+                          : 'bg-blue-600 text-white'
+                        : isDark
+                        ? 'text-zinc-400 hover:text-white'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
                   >
-                    <svg
-                      version="1.1"
-                      xmlns="http://www.w3.org/2000/svg"
-                      viewBox="0 0 48 48"
-                      className="w-4 h-4 shrink-0"
-                    >
-                      <path
-                        fill="#EA4335"
-                        d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                      />
-                      <path
-                        fill="#4285F4"
-                        d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                      />
-                      <path
-                        fill="#FBBC05"
-                        d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                      />
-                      <path
-                        fill="#34A853"
-                        d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                      />
-                      <path fill="none" d="M0 0h48v48H0z" />
-                    </svg>
-                    <span>{isSigningInGoogle ? 'Menghubungkan...' : 'Sign in with Google'}</span>
+                    Simpan di Panel Saja
                   </button>
                   <button
                     type="button"
                     onClick={() => {
+                      setSaveManualToDrive(true);
+                      if (!isDriveConnected) {
+                        setIsDriveConfigModalOpen(true);
+                      }
+                    }}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      saveManualToDrive
+                        ? isDark
+                          ? 'bg-red-600 text-white'
+                          : 'bg-blue-600 text-white'
+                        : isDark
+                        ? 'text-zinc-400 hover:text-white'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Simpan ke Panel + Google Drive
+                  </button>
+                </div>
+
+                {/* Connected Account Actions */}
+                {isDriveConnected && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`text-xs font-mono truncate max-w-[200px] ${isDark ? 'text-emerald-400' : 'text-emerald-700'}`}>
+                      {googleUser?.email}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={isTestingDrive}
+                      onClick={handleVerifyDriveBackupNow}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                        isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
+                      }`}
+                    >
+                      <CloudUpload className="w-3.5 h-3.5" />
+                      {isTestingDrive ? 'Mengunggah ke Drive...' : 'Simpan Backup ke Drive Sekarang'}
+                    </button>
+                    {lastDriveTestLink && (
+                      <a
+                        href={lastDriveTestLink}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                          isDark
+                            ? 'border-emerald-700/60 bg-emerald-950/30 text-emerald-300'
+                            : 'border-emerald-300 bg-emerald-50 text-emerald-800'
+                        }`}
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        Lihat di Drive
+                      </a>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDriveModalAutoReason(null);
+                        setIsDriveConfigModalOpen(true);
+                      }}
+                      aria-label="Pengaturan Google Drive Vercel"
+                      className={`px-2.5 py-1.5 rounded-lg border text-xs inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                        isDark
+                          ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
+                          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      <Settings className="w-3.5 h-3.5" />
+                      Ubah Tautan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleGoogleLogout}
+                      aria-label="Keluar dari Google Drive"
+                      className={`px-2.5 py-1.5 rounded-lg border text-xs inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                        isDark
+                          ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
+                          : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      Putuskan Drive
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Inline 1-Step Quick-Connect Box when Google Drive is not connected yet */}
+            {!isDriveConnected && (
+              <div
+                className={`p-3.5 rounded-lg border flex flex-col xl:flex-row xl:items-center justify-between gap-3 ${
+                  isDark ? 'bg-[#121215] border-[#27272A]' : 'bg-white border-slate-200'
+                }`}
+              >
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-1 min-w-0">
+                  <input
+                    type="url"
+                    value={quickBridgeUrl}
+                    onChange={(e) => setQuickBridgeUrl(e.target.value)}
+                    placeholder="Tempel URL Google Script (https://script.google.com/macros/s/.../exec) — Tanpa Login & Anti-Ribet"
+                    aria-label="URL Google Script Bridge"
+                    className={`flex-1 min-w-0 px-3 py-2 text-xs rounded-lg border font-mono ${
+                      isDark
+                        ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
+                        : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
+                    }`}
+                  />
+                  <input
+                    type="text"
+                    value={quickFolderUrl}
+                    onChange={(e) => setQuickFolderUrl(e.target.value)}
+                    placeholder="Opsional: Link Folder Google Drive tujuan"
+                    aria-label="Link Folder Google Drive Tujuan"
+                    className={`sm:w-64 min-w-0 px-3 py-2 text-xs rounded-lg border font-mono ${
+                      isDark
+                        ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
+                        : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
+                    }`}
+                  />
+                  <button
+                    type="button"
+                    disabled={isSigningInGoogle}
+                    onClick={async () => {
+                      if (!quickBridgeUrl.trim()) {
+                        setDriveModalAutoReason(null);
+                        setIsDriveConfigModalOpen(true);
+                        return;
+                      }
+                      setIsSigningInGoogle(true);
+                      try {
+                        const res = await connectWithAppsScriptBridge(quickBridgeUrl, quickFolderUrl);
+                        setGoogleUser(res.user);
+                        setGoogleToken(res.accessToken);
+                        setSaveManualToDrive(true);
+                        appendLog(
+                          'Google Drive Terhubung (Tautan Permanen)',
+                          res.user.email || 'Google Drive',
+                          'Berhasil menautkan Google Drive tanpa OAuth.',
+                          'success'
+                        );
+                        showNotice('Google Drive berhasil ditautkan secara permanen!', 'success');
+                      } catch (err: any) {
+                        showNotice(err?.message || 'URL Google Script tidak valid.', 'error');
+                      } finally {
+                        setIsSigningInGoogle(false);
+                      }
+                    }}
+                    className={`px-4 py-2 rounded-lg text-xs font-semibold text-white whitespace-nowrap shrink-0 transition-colors ${
+                      isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
+                    }`}
+                  >
+                    Tautkan Drive Sekarang
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const code = buildGoogleAppsScriptCode(quickFolderUrl);
+                      navigator.clipboard?.writeText(code).catch(() => {});
+                      setCopiedQuickScript(true);
+                      setTimeout(() => setCopiedQuickScript(false), 3000);
                       setDriveModalAutoReason(null);
                       setIsDriveConfigModalOpen(true);
                     }}
@@ -1287,72 +1397,20 @@ export function App() {
                     }`}
                   >
                     <Settings className="w-3.5 h-3.5" />
-                    Opsi Login Google (Fix Vercel)
+                    {copiedQuickScript ? 'Kode Disalin! Lihat Cara Pasang' : 'Salin Kode Script & Cara Pasang (30 Detik)'}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isSigningInGoogle}
+                    onClick={handleGoogleLogin}
+                    className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <span>Popup Google</span>
                   </button>
                 </div>
-              ) : (
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={`text-xs font-mono truncate max-w-[180px] ${isDark ? 'text-emerald-400' : 'text-emerald-700'}`}>
-                    {googleUser?.email}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={isTestingDrive}
-                    onClick={handleVerifyDriveBackupNow}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
-                      isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
-                    }`}
-                  >
-                    <CloudUpload className="w-3.5 h-3.5" />
-                    {isTestingDrive ? 'Mengunggah ke Drive...' : 'Simpan Backup ke Drive Sekarang'}
-                  </button>
-                  {lastDriveTestLink && (
-                    <a
-                      href={lastDriveTestLink}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-                        isDark
-                          ? 'border-emerald-700/60 bg-emerald-950/30 text-emerald-300'
-                          : 'border-emerald-300 bg-emerald-50 text-emerald-800'
-                      }`}
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                      Lihat di Drive
-                    </a>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDriveModalAutoReason(null);
-                      setIsDriveConfigModalOpen(true);
-                    }}
-                    aria-label="Pengaturan Google Drive Vercel"
-                    className={`px-2.5 py-1.5 rounded-lg border text-xs inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-                      isDark
-                        ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
-                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    <Settings className="w-3.5 h-3.5" />
-                    Pengaturan Drive
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleGoogleLogout}
-                    aria-label="Keluar dari Google Drive"
-                    className={`px-2.5 py-1.5 rounded-lg border text-xs inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
-                      isDark
-                        ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
-                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
-                    }`}
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                    Putuskan Drive
-                  </button>
-                </div>
-              )}
-            </div>
+              </div>
+            )}
           </div>
 
           {/* Summary KPI Strip */}

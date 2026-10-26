@@ -8,6 +8,8 @@ import {
   calculateNextScheduleRun,
   formatBytes,
   selectBackupsToAutoDelete,
+  extractDriveFolderId,
+  validateAppsScriptUrl,
 } from './backupLogic';
 import { buildServerDriveFolderName } from '../services/googleDriveService';
 import { PteroServer, PteroBackupFile } from '../types/pterodactyl';
@@ -202,4 +204,25 @@ test('calculateNextScheduleRun computes accurate future timestamps', () => {
 test('formatBytes formats megabytes and gigabytes cleanly', () => {
   assert.equal(formatBytes(524288000), '500.0 MB');
   assert.equal(formatBytes(2147483648), '2.00 GB');
+});
+
+test('extractDriveFolderId extracts folder ID from Google Drive URLs or raw ID', () => {
+  assert.equal(
+    extractDriveFolderId('https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz?usp=sharing'),
+    '1AbCdEfGhIjKlMnOpQrStUvWxYz'
+  );
+  assert.equal(
+    extractDriveFolderId('https://drive.google.com/drive/u/0/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz'),
+    '1AbCdEfGhIjKlMnOpQrStUvWxYz'
+  );
+  assert.equal(extractDriveFolderId('1AbCdEfGhIjKlMnOpQrStUvWxYz'), '1AbCdEfGhIjKlMnOpQrStUvWxYz');
+  assert.equal(extractDriveFolderId(''), '');
+});
+
+test('validateAppsScriptUrl validates Google Apps Script Web App URLs', () => {
+  const valid = validateAppsScriptUrl('https://script.google.com/macros/s/AKfycbx1234567890/exec');
+  assert.equal(valid.valid, true);
+
+  const invalid = validateAppsScriptUrl('https://example.com/webhook');
+  assert.equal(invalid.valid, false);
 });

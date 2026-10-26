@@ -9,6 +9,7 @@ import {
   User,
 } from 'firebase/auth';
 import rawFirebaseConfig from '../../firebase-applet-config.json';
+import { extractDriveFolderId, validateAppsScriptUrl } from '../utils/backupLogic';
 
 export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
@@ -16,15 +17,19 @@ export interface GoogleDriveUser {
   email: string | null;
   displayName: string | null;
   photoURL?: string | null;
-  authMethod?: 'firebase' | 'gis_client' | 'direct_token';
+  folderUrl?: string | null;
+  authMethod?: 'apps_script_bridge' | 'firebase' | 'gis_client' | 'direct_token';
 }
 
 export interface GoogleDriveAuthConfig {
+  appsScriptUrl?: string;
+  targetFolderId?: string;
   customClientId: string;
   directAccessToken: string;
   refreshToken: string;
   clientSecret: string;
   connectedEmail?: string;
+  connectedFolderUrl?: string;
 }
 
 const GDRIVE_CONFIG_STORAGE_KEY = 'pterovault_gdrive_vercel_config_v1';
@@ -59,17 +64,22 @@ export function getSavedDriveAuthConfig(): GoogleDriveAuthConfig {
     if (raw) {
       const parsed = JSON.parse(raw);
       return {
+        appsScriptUrl: String(parsed.appsScriptUrl || '').trim(),
+        targetFolderId: String(parsed.targetFolderId || '').trim(),
         customClientId: String(parsed.customClientId || '').trim(),
         directAccessToken: String(parsed.directAccessToken || '').trim(),
         refreshToken: String(parsed.refreshToken || '').trim(),
         clientSecret: String(parsed.clientSecret || '').trim(),
         connectedEmail: parsed.connectedEmail || undefined,
+        connectedFolderUrl: parsed.connectedFolderUrl || undefined,
       };
     }
   } catch {
     // ignore storage read error
   }
   return {
+    appsScriptUrl: '',
+    targetFolderId: '',
     customClientId: import.meta.env.VITE_GOOGLE_CLIENT_ID || '',
     directAccessToken: '',
     refreshToken: '',
@@ -94,6 +104,80 @@ export function getDefaultFirebaseProjectId(): string {
 }
 
 /**
+ * Connects Google Drive using the zero-OAuth Google Apps Script Bridge URL (100% Permanent & Vercel-friendly).
+ */
+export async function connectWithAppsScriptBridge(
+  rawScriptUrl: string,
+  rawFolderInput = ''
+): Promise<{ user: GoogleDriveUser; accessToken: string }> {
+  const validation = validateAppsScriptUrl(rawScriptUrl);
+  if (!validation.valid) {
+    throw new Error(validation.error || 'URL Google Script tidak valid.');
+  }
+
+  const cleanUrl = validation.cleanUrl;
+  const folderId = extractDriveFolderId(rawFolderInput);
+
+  let detectedEmail = 'Google Drive (Bridge Permanen Aktif)';
+  let detectedFolderUrl = folderId
+    ? `https://drive.google.com/drive/folders/${folderId}`
+    : undefined;
+
+  // Test ping to Google Apps Script Web App
+  try {
+    const pingRes = await fetch(cleanUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'ping',
+        targetFolderId: folderId,
+        rootFolderName: 'PteroVault_Backups',
+      }),
+    });
+
+    if (pingRes.ok) {
+      const data = await pingRes.json().catch(() => null);
+      if (data && data.ok === false) {
+        throw new Error(`Script Google Drive merespons error: ${data.error || 'Unknown error'}`);
+      }
+      if (data?.email) {
+        detectedEmail = data.email;
+      }
+      if (data?.folderUrl) {
+        detectedFolderUrl = data.folderUrl;
+      }
+    }
+  } catch (err: any) {
+    if (String(err?.message || '').includes('Script Google Drive merespons error')) {
+      throw err;
+    }
+    // Even if browser blocks reading redirect response, the bridge URL itself is valid
+  }
+
+  const bridgeToken = `BRIDGE::${cleanUrl}::${folderId}`;
+  const bridgeUser: GoogleDriveUser = {
+    email: detectedEmail,
+    displayName: 'Google Drive Bridge',
+    folderUrl: detectedFolderUrl || null,
+    authMethod: 'apps_script_bridge',
+  };
+
+  cachedAccessToken = bridgeToken;
+  cachedTokenExpiryMs = Number.MAX_SAFE_INTEGER;
+  cachedUser = bridgeUser;
+
+  saveDriveAuthConfig({
+    ...getSavedDriveAuthConfig(),
+    appsScriptUrl: cleanUrl,
+    targetFolderId: folderId,
+    connectedEmail: detectedEmail,
+    connectedFolderUrl: detectedFolderUrl,
+  });
+
+  return { user: bridgeUser, accessToken: bridgeToken };
+}
+
+/**
  * Verifies a Google OAuth2 access token against Google Drive API v3
  * and returns the associated Google account profile.
  */
@@ -101,6 +185,12 @@ export async function verifyGoogleDriveToken(accessToken: string): Promise<Googl
   const cleanToken = accessToken.trim();
   if (!cleanToken) {
     throw new Error('Access Token Google Drive kosong.');
+  }
+
+  if (cleanToken.startsWith('BRIDGE::')) {
+    const parts = cleanToken.split('::');
+    const res = await connectWithAppsScriptBridge(parts[1] || '', parts[2] || '');
+    return res.user;
   }
 
   // 1. Check Drive v3 about endpoint (works with drive.file scope)
@@ -138,7 +228,7 @@ export async function verifyGoogleDriveToken(accessToken: string): Promise<Googl
 
   const errText = await filesRes.text().catch(() => '');
   throw new Error(
-    `Token Google Drive tidak valid atau sudah kadaluarsa (HTTP ${filesRes.status}). Pastikan scope https://www.googleapis.com/auth/drive.file diaktifkan. ${errText.slice(0, 120)}`
+    `Token Google Drive tidak valid atau sudah kadaluarsa (HTTP ${filesRes.status}). ${errText.slice(0, 120)}`
   );
 }
 
@@ -187,7 +277,6 @@ export async function refreshGoogleAccessToken(
 
 /**
  * Dynamically loads Google Identity Services (GIS) script (https://accounts.google.com/gsi/client)
- * so OAuth popup login works directly on Vercel without Firebase Auth domain restrictions.
  */
 function loadGoogleGsiScript(): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -213,8 +302,6 @@ function loadGoogleGsiScript(): Promise<void> {
 
 /**
  * Performs Google OAuth2 Popup Login using Google Identity Services (GIS) directly.
- * Works on Vercel when the Vercel URL is added to Google Cloud OAuth Authorized JavaScript Origins
- * or with a user-supplied Google OAuth Client ID.
  */
 export async function signInWithGoogleGIS(
   clientIdOverride?: string
@@ -250,7 +337,7 @@ export async function signInWithGoogleGIS(
             reject(
               new Error(
                 `Google OAuth Error (${tokenResponse.error}): ${
-                  tokenResponse.error_description || 'Pastikan URL Vercel Anda sudah terdaftar di Authorized JavaScript Origins.'
+                  tokenResponse.error_description || 'Gunakan metode Tautan Cepat Google Script (Tanpa Login) untuk Vercel.'
                 }`
               )
             );
@@ -286,7 +373,7 @@ export async function signInWithGoogleGIS(
           reject(
             new Error(
               err?.message ||
-                'Popup login Google ditutup atau diblokir oleh browser. Gunakan pengaturan Google Drive untuk opsi koneksi Vercel.'
+                'Popup login Google ditutup. Gunakan Tautan Cepat Google Drive (Tanpa Login OAuth) agar lebih simpel.'
             )
           );
         },
@@ -300,7 +387,7 @@ export async function signInWithGoogleGIS(
 }
 
 /**
- * Connects Google Drive using a direct Access Token or Refresh Token (100% Domain-Independent on Vercel)
+ * Connects Google Drive using a direct Access Token or Refresh Token
  */
 export async function connectWithDirectTokenOrRefresh(
   config: GoogleDriveAuthConfig
@@ -332,7 +419,26 @@ export const initAuth = (
   onAuthSuccess?: (user: GoogleDriveUser, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  // 1. Check if we returned from a Firebase signInWithRedirect flow
+  const savedCfg = getSavedDriveAuthConfig();
+
+  // 1. Check if Permanent Google Apps Script Bridge is configured (Zero-OAuth, Never Expires!)
+  if (savedCfg.appsScriptUrl) {
+    const bridgeToken = `BRIDGE::${savedCfg.appsScriptUrl}::${savedCfg.targetFolderId || ''}`;
+    const bridgeUser: GoogleDriveUser = {
+      email: savedCfg.connectedEmail || 'Google Drive (Tautan Permanen Aktif)',
+      displayName: 'Google Drive Bridge',
+      folderUrl: savedCfg.connectedFolderUrl || null,
+      authMethod: 'apps_script_bridge',
+    };
+    cachedAccessToken = bridgeToken;
+    cachedTokenExpiryMs = Number.MAX_SAFE_INTEGER;
+    cachedUser = bridgeUser;
+    if (onAuthSuccess) {
+      setTimeout(() => onAuthSuccess(bridgeUser, bridgeToken), 0);
+    }
+  }
+
+  // 2. Check if we returned from a Firebase signInWithRedirect flow
   getRedirectResult(auth)
     .then((result) => {
       if (result) {
@@ -354,9 +460,8 @@ export const initAuth = (
       // ignore redirect check errors
     });
 
-  // 2. Check if there is a saved direct token or refresh token from Vercel config
-  const savedCfg = getSavedDriveAuthConfig();
-  if (savedCfg.refreshToken && savedCfg.clientSecret) {
+  // 3. Check if there is a saved direct token or refresh token
+  if (!savedCfg.appsScriptUrl && savedCfg.refreshToken && savedCfg.clientSecret) {
     refreshGoogleAccessToken(savedCfg)
       .then(async ({ accessToken, expiresIn }) => {
         const user = await verifyGoogleDriveToken(accessToken);
@@ -365,10 +470,8 @@ export const initAuth = (
         cachedUser = user;
         if (onAuthSuccess) onAuthSuccess(user, accessToken);
       })
-      .catch(() => {
-        // ignore startup refresh failure
-      });
-  } else if (savedCfg.directAccessToken) {
+      .catch(() => {});
+  } else if (!savedCfg.appsScriptUrl && savedCfg.directAccessToken) {
     verifyGoogleDriveToken(savedCfg.directAccessToken)
       .then((user) => {
         cachedAccessToken = savedCfg.directAccessToken;
@@ -377,13 +480,12 @@ export const initAuth = (
         if (onAuthSuccess) onAuthSuccess(user, savedCfg.directAccessToken);
       })
       .catch(() => {
-        // Token expired, clear directAccessToken
         saveDriveAuthConfig({ ...savedCfg, directAccessToken: '' });
       });
   }
 
   return onAuthStateChanged(auth, async (user: User | null) => {
-    if (user && cachedAccessToken) {
+    if (user && cachedAccessToken && !cachedAccessToken.startsWith('BRIDGE::')) {
       const mapped: GoogleDriveUser = {
         email: user.email,
         displayName: user.displayName,
@@ -401,6 +503,11 @@ export const initAuth = (
 export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessToken: string } | null> => {
   const savedCfg = getSavedDriveAuthConfig();
 
+  // If Apps Script Bridge URL is already saved, use it immediately!
+  if (savedCfg.appsScriptUrl) {
+    return await connectWithAppsScriptBridge(savedCfg.appsScriptUrl, savedCfg.targetFolderId);
+  }
+
   // If user configured a Refresh Token + Client Secret, auto-refresh seamlessly
   if (savedCfg.refreshToken && savedCfg.clientSecret) {
     try {
@@ -410,7 +517,6 @@ export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessTok
     }
   }
 
-  // If user configured a custom Google OAuth Client ID (e.g. for Vercel), use GIS directly!
   if (savedCfg.customClientId) {
     return await signInWithGoogleGIS(savedCfg.customClientId);
   }
@@ -437,19 +543,17 @@ export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessTok
     const errCode = String(error?.code || '');
     const errMsg = String(error?.message || '');
 
-    // When deployed to Vercel (*.vercel.app) or a custom domain not yet in Firebase Authorized Domains:
     if (
       errCode === 'auth/unauthorized-domain' ||
       errCode === 'auth/operation-not-supported-in-this-environment' ||
       errCode === 'auth/invalid-api-key' ||
       errMsg.includes('unauthorized-domain')
     ) {
-      // Try Google Identity Services (GIS) popup as immediate fallback
       try {
         return await signInWithGoogleGIS(firebaseConfig.oAuthClientId);
       } catch {
         const domainErr: any = new Error(
-          `Domain "${window.location.hostname}" belum diotorisasi di Firebase Auth atau membutuhkan pengaturan OAuth Vercel.`
+          `Domain "${window.location.hostname}" memblokir popup OAuth. Gunakan Tautan Cepat Google Drive (Tanpa Login OAuth) yang jauh lebih simpel.`
         );
         domainErr.code = 'VERCEL_DOMAIN_SETUP_REQUIRED';
         domainErr.hostname = window.location.hostname;
@@ -473,12 +577,14 @@ export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessTok
 export const getAccessToken = async (): Promise<string | null> => {
   const savedCfg = getSavedDriveAuthConfig();
 
-  // If cached token is still valid, return it
+  if (savedCfg.appsScriptUrl) {
+    return `BRIDGE::${savedCfg.appsScriptUrl}::${savedCfg.targetFolderId || ''}`;
+  }
+
   if (cachedAccessToken && Date.now() < cachedTokenExpiryMs - 60000) {
     return cachedAccessToken;
   }
 
-  // If Refresh Token is configured, automatically renew token in background!
   if (savedCfg.refreshToken && savedCfg.clientSecret) {
     try {
       const refreshed = await refreshGoogleAccessToken(savedCfg);
@@ -505,7 +611,10 @@ export const logoutGoogle = async () => {
   const savedCfg = getSavedDriveAuthConfig();
   saveDriveAuthConfig({
     ...savedCfg,
+    appsScriptUrl: '',
     directAccessToken: '',
     refreshToken: '',
+    connectedEmail: undefined,
+    connectedFolderUrl: undefined,
   });
 };

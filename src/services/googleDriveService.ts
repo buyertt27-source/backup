@@ -5,7 +5,11 @@ import { buildBackupManifestContent } from '../utils/backupLogic';
  * Formats the isolated Google Drive folder name for a specific Pterodactyl server
  * so Server 1, Server 2, etc. each get their own separated folder inside PteroVault_Backups.
  */
-export function buildServerDriveFolderName(serverOrdinal: number, serverIdentifier: string, serverName: string): string {
+export function buildServerDriveFolderName(
+  serverOrdinal: number,
+  serverIdentifier: string,
+  serverName: string
+): string {
   const cleanName = serverName.replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 32);
   return `Server_${String(serverOrdinal).padStart(2, '0')}_${serverIdentifier}_${cleanName}`;
 }
@@ -43,7 +47,6 @@ export async function findOrCreateDriveFolder(
     }
   }
 
-  // Create folder if not found
   const metadata: Record<string, any> = {
     name: folderName,
     mimeType: 'application/vnd.google-apps.folder',
@@ -76,7 +79,10 @@ export async function findOrCreateDriveFolder(
 }
 
 /**
- * Uploads a server backup archive (or transfers via backend from Wings signed URL) into its isolated Google Drive folder.
+ * Uploads a server backup archive into its isolated Google Drive folder.
+ * Supports both:
+ * 1) Zero-OAuth Google Apps Script Bridge URL (BRIDGE::<scriptUrl>::<folderId>) — simplest & never expires on Vercel!
+ * 2) Standard Google Drive API v3 OAuth Bearer token.
  */
 export async function uploadBackupToGoogleDrive(params: {
   accessToken: string;
@@ -92,16 +98,113 @@ export async function uploadBackupToGoogleDrive(params: {
   updatedStatus?: 'completed' | 'in_progress' | 'failed';
 }> {
   const { accessToken, backup, serverOrdinal, domain, pltsKey } = params;
+  const serverFolderName = buildServerDriveFolderName(
+    serverOrdinal,
+    backup.serverIdentifier,
+    backup.serverName
+  );
 
-  // 1. Ensure Root Folder "PteroVault_Backups" exists in Google Drive
+  // ============================================================================
+  // MODE 1: ZERO-OAUTH GOOGLE APPS SCRIPT BRIDGE (BRIDGE::<scriptUrl>::<folderId>)
+  // ============================================================================
+  if (accessToken.startsWith('BRIDGE::')) {
+    const parts = accessToken.split('::');
+    const appsScriptUrl = parts[1] || '';
+    const targetFolderId = parts[2] || '';
+
+    if (!appsScriptUrl) {
+      throw new Error('URL Google Drive Bridge belum diisi.');
+    }
+
+    // 1A. Try via backend proxy first if connected to real Pterodactyl server (so Wings signed URL is passed to Google Drive)
+    if (domain && pltsKey && backup.uuid && !backup.uuid.startsWith('drive-test-')) {
+      try {
+        const proxyRes = await fetch('/api/pterodactyl/backup/upload-to-drive', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            appsScriptUrl,
+            targetFolderId,
+            serverFolderName,
+            domain,
+            pltsKey,
+            serverIdentifier: backup.serverIdentifier,
+            backupUuid: backup.uuid,
+            fileName: backup.fileName,
+          }),
+        });
+
+        if (proxyRes.ok) {
+          const proxyData = await proxyRes.json();
+          if (proxyData.ok && proxyData.driveFileId) {
+            return {
+              driveFileId: proxyData.driveFileId,
+              driveWebViewLink:
+                proxyData.webViewLink || `https://drive.google.com/file/d/${proxyData.driveFileId}/view`,
+              driveFolderName: proxyData.folderName || `PteroVault_Backups/${serverFolderName}`,
+              updatedSizeBytes: proxyData.sizeBytes,
+              updatedStatus: proxyData.status,
+            };
+          }
+        }
+      } catch {
+        // Fallback to direct client-side POST to Apps Script below
+      }
+    }
+
+    // 1B. Direct client-side POST to Google Apps Script Web App (uses text/plain for CORS-safe execution)
+    const manifestContent = buildBackupManifestContent(backup, domain);
+    const base64Payload = btoa(unescape(encodeURIComponent(manifestContent)));
+
+    const bridgeRes = await fetch(appsScriptUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8',
+      },
+      body: JSON.stringify({
+        action: 'upload',
+        targetFolderId,
+        rootFolderName: 'PteroVault_Backups',
+        serverFolderName,
+        fileName: backup.fileName,
+        base64Payload,
+        mimeType: 'application/gzip',
+      }),
+    });
+
+    if (!bridgeRes.ok) {
+      throw new Error(
+        `Gagal mengirim backup ke URL Google Script (HTTP ${bridgeRes.status}). Pastikan Web App di-deploy dengan akses "Anyone".`
+      );
+    }
+
+    const bridgeData = await bridgeRes.json().catch(() => null);
+    if (bridgeData && bridgeData.ok === false) {
+      throw new Error(`Google Drive Script Error: ${bridgeData.error || 'Gagal menyimpan file'}`);
+    }
+
+    const fileId = bridgeData?.fileId || `gdrive-${Date.now()}`;
+    return {
+      driveFileId: fileId,
+      driveWebViewLink:
+        bridgeData?.webViewLink ||
+        (targetFolderId
+          ? `https://drive.google.com/drive/folders/${targetFolderId}`
+          : 'https://drive.google.com/drive/my-drive'),
+      driveFolderName: bridgeData?.folderName || `PteroVault_Backups/${serverFolderName}`,
+      updatedSizeBytes: bridgeData?.sizeBytes || backup.sizeBytes,
+    };
+  }
+
+  // ============================================================================
+  // MODE 2: STANDARD GOOGLE DRIVE API V3 (OAUTH BEARER TOKEN)
+  // ============================================================================
   const rootFolderId = await findOrCreateDriveFolder(accessToken, 'PteroVault_Backups');
-
-  // 2. Ensure Isolated Per-Server Subfolder exists (e.g. "Server_01_srv01a9f_PaperMC")
-  const serverFolderName = buildServerDriveFolderName(serverOrdinal, backup.serverIdentifier, backup.serverName);
   const serverFolderId = await findOrCreateDriveFolder(accessToken, serverFolderName, rootFolderId);
 
-  // 3. Try transferring the binary archive via our server-side proxy (which also polls Wings until completion)
-  if (domain && pltsKey && backup.uuid) {
+  if (domain && pltsKey && backup.uuid && !backup.uuid.startsWith('drive-test-')) {
     try {
       const proxyRes = await fetch('/api/pterodactyl/backup/upload-to-drive', {
         method: 'POST',
@@ -133,11 +236,10 @@ export async function uploadBackupToGoogleDrive(params: {
         }
       }
     } catch {
-      // Fallback to direct client-side upload below if server proxy times out
+      // Fallback to direct client-side upload below
     }
   }
 
-  // 4. Direct client-side resumable/multipart upload to Google Drive
   const manifestContent = buildBackupManifestContent(backup, domain);
   const boundary = '-------pterovault_drive_multipart_boundary';
   const metadata = {

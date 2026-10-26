@@ -308,6 +308,128 @@ export function selectBackupsToAutoDelete(
 }
 
 /**
+ * Extracts a clean Google Drive Folder ID from either a full Google Drive folder URL
+ * (e.g. https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRsTuVwXyZ?usp=sharing)
+ * or a raw Folder ID string.
+ */
+export function extractDriveFolderId(rawInput: string): string {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return '';
+
+  const folderMatch = trimmed.match(/\/folders\/([a-zA-Z0-9_-]{10,})/);
+  if (folderMatch && folderMatch[1]) {
+    return folderMatch[1];
+  }
+
+  const idParamMatch = trimmed.match(/[?&]id=([a-zA-Z0-9_-]{10,})/);
+  if (idParamMatch && idParamMatch[1]) {
+    return idParamMatch[1];
+  }
+
+  if (/^[a-zA-Z0-9_-]{10,}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  return '';
+}
+
+/**
+ * Validates whether a URL is a valid Google Apps Script Web App URL (https://script.google.com/macros/s/.../exec)
+ */
+export function validateAppsScriptUrl(rawUrl: string): { valid: boolean; cleanUrl: string; error?: string } {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) {
+    return { valid: false, cleanUrl: '', error: 'URL Web App Google Script wajib diisi.' };
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const isGoogleScript =
+      parsed.hostname === 'script.google.com' ||
+      parsed.hostname === 'script.googleusercontent.com';
+    if (!isGoogleScript || !parsed.pathname.includes('/macros/')) {
+      return {
+        valid: false,
+        cleanUrl: trimmed,
+        error: 'Format URL harus berupa Web App Google Script (https://script.google.com/macros/s/.../exec).',
+      };
+    }
+    return { valid: true, cleanUrl: trimmed };
+  } catch {
+    return { valid: false, cleanUrl: trimmed, error: 'Format URL tidak valid.' };
+  }
+}
+
+/**
+ * Generates the ready-to-paste Google Apps Script code (doPost) that acts as a permanent,
+ * zero-OAuth Google Drive bridge for PteroVault Backups (works on Vercel 24/7 without token expiry).
+ */
+export function buildGoogleAppsScriptCode(defaultFolderId = ''): string {
+  const cleanFolderId = extractDriveFolderId(defaultFolderId);
+  return `// PteroVault -> Google Drive Bridge (100% Tanpa OAuth & Anti-Expired untuk Vercel)
+// Tempel kode ini di https://script.google.com -> Klik Deploy -> New deployment -> Web app -> Anyone -> Copy URL
+
+var DEFAULT_FOLDER_ID = "${cleanFolderId}";
+
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var rootFolder = null;
+    var folderIdToUse = data.targetFolderId || DEFAULT_FOLDER_ID;
+
+    if (folderIdToUse) {
+      try { rootFolder = DriveApp.getFolderById(folderIdToUse); } catch (err) {}
+    }
+    if (!rootFolder) {
+      var rootName = data.rootFolderName || "PteroVault_Backups";
+      var roots = DriveApp.getFoldersByName(rootName);
+      rootFolder = roots.hasNext() ? roots.next() : DriveApp.createFolder(rootName);
+    }
+
+    if (data.action === "ping") {
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        email: Session.getEffectiveUser().getEmail() || "Google Drive Terhubung",
+        folderName: rootFolder.getName(),
+        folderUrl: rootFolder.getUrl()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var subName = data.serverFolderName || "Server_01";
+    var subs = rootFolder.getFoldersByName(subName);
+    var subFolder = subs.hasNext() ? subs.next() : rootFolder.createFolder(subName);
+
+    var fileName = data.fileName || ("backup_" + new Date().getTime() + ".tar.gz");
+    var blob = null;
+
+    if (data.signedWingsUrl) {
+      try {
+        blob = UrlFetchApp.fetch(data.signedWingsUrl, { muteHttpExceptions: true }).getBlob().setName(fileName);
+      } catch (fetchErr) {}
+    }
+
+    if (!blob && data.base64Payload) {
+      var bytes = Utilities.base64Decode(data.base64Payload);
+      blob = Utilities.newBlob(bytes, data.mimeType || "application/gzip", fileName);
+    }
+
+    var file = subFolder.createFile(blob);
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: true,
+      fileId: file.getId(),
+      webViewLink: file.getUrl(),
+      folderName: rootFolder.getName() + "/" + subName,
+      sizeBytes: file.getSize()
+    })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok: false,
+      error: err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}`;
+}
+
+/**
  * Generates downloadable metadata manifest for a backup archive
  */
 export function buildBackupManifestContent(backup: PteroBackupFile, domain: string): string {

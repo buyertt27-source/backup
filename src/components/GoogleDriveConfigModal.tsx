@@ -4,22 +4,20 @@ import {
   GoogleDriveAuthConfig,
   GoogleDriveUser,
   getSavedDriveAuthConfig,
-  saveDriveAuthConfig,
-  getDefaultOAuthClientId,
-  getDefaultFirebaseProjectId,
-  signInWithGoogleGIS,
+  connectWithAppsScriptBridge,
   connectWithDirectTokenOrRefresh,
 } from '../services/googleDriveAuth';
+import { buildGoogleAppsScriptCode } from '../utils/backupLogic';
 import {
   X,
   Copy,
   Check,
   ExternalLink,
-  KeyRound,
-  ShieldCheck,
-  Globe,
   CloudUpload,
   AlertCircle,
+  Sparkles,
+  FolderOpen,
+  Link2,
 } from 'lucide-react';
 
 interface GoogleDriveConfigModalProps {
@@ -37,29 +35,21 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
   theme,
   autoOpenedReason,
 }) => {
-  const [activeTab, setActiveTab] = useState<'instant_token' | 'custom_client' | 'firebase_domain'>(
-    'instant_token'
-  );
-  const [customClientId, setCustomClientId] = useState<string>('');
+  const [activeTab, setActiveTab] = useState<'simple_bridge' | 'direct_token'>('simple_bridge');
+  const [appsScriptUrl, setAppsScriptUrl] = useState<string>('');
+  const [targetFolderUrl, setTargetFolderUrl] = useState<string>('');
   const [directAccessToken, setDirectAccessToken] = useState<string>('');
-  const [refreshToken, setRefreshToken] = useState<string>('');
-  const [clientSecret, setClientSecret] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [copiedField, setCopiedField] = useState<string | null>(null);
-
-  const currentHostname = typeof window !== 'undefined' ? window.location.hostname : 'nama-app.vercel.app';
-  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://nama-app.vercel.app';
-  const defaultProjectId = getDefaultFirebaseProjectId();
-  const defaultClientId = getDefaultOAuthClientId();
+  const [copiedScript, setCopiedScript] = useState<boolean>(false);
+  const [showScriptPreview, setShowScriptPreview] = useState<boolean>(false);
 
   useEffect(() => {
     if (isOpen) {
       const saved = getSavedDriveAuthConfig();
-      setCustomClientId(saved.customClientId || '');
+      setAppsScriptUrl(saved.appsScriptUrl || '');
+      setTargetFolderUrl(saved.targetFolderId || '');
       setDirectAccessToken(saved.directAccessToken || '');
-      setRefreshToken(saved.refreshToken || '');
-      setClientSecret(saved.clientSecret || '');
       setErrorMsg(autoOpenedReason || null);
     }
   }, [isOpen, autoOpenedReason]);
@@ -67,59 +57,53 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
   if (!isOpen) return null;
 
   const isDark = theme === 'dark';
+  const generatedScriptCode = buildGoogleAppsScriptCode(targetFolderUrl);
 
-  const handleCopy = (text: string, label: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
-    setCopiedField(label);
-    setTimeout(() => setCopiedField(null), 2000);
+  const handleCopyScript = () => {
+    navigator.clipboard?.writeText(generatedScriptCode).catch(() => {});
+    setCopiedScript(true);
+    setTimeout(() => setCopiedScript(false), 3000);
+  };
+
+  const handleConnectBridge = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    if (!appsScriptUrl.trim()) {
+      setErrorMsg('Tempelkan URL Web App Google Script (https://script.google.com/macros/s/.../exec) terlebih dahulu.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const result = await connectWithAppsScriptBridge(appsScriptUrl, targetFolderUrl);
+      onConnected(result.user, result.accessToken);
+      onClose();
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Gagal menghubungkan URL Google Drive Bridge.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleConnectDirectToken = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
-    if (!directAccessToken.trim() && !(refreshToken.trim() && clientSecret.trim())) {
-      setErrorMsg('Masukkan Access Token Google Drive (ya29...) atau pasangan Refresh Token + Client Secret.');
+    if (!directAccessToken.trim()) {
+      setErrorMsg('Tempelkan Access Token Google Drive (ya29...) terlebih dahulu.');
       return;
     }
 
     setIsSubmitting(true);
     try {
       const cfg: GoogleDriveAuthConfig = {
-        customClientId: customClientId.trim(),
+        ...getSavedDriveAuthConfig(),
         directAccessToken: directAccessToken.trim(),
-        refreshToken: refreshToken.trim(),
-        clientSecret: clientSecret.trim(),
       };
       const result = await connectWithDirectTokenOrRefresh(cfg);
       onConnected(result.user, result.accessToken);
       onClose();
     } catch (err: any) {
       setErrorMsg(err?.message || 'Gagal memverifikasi token Google Drive.');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const handleConnectGisPopup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-    const clientToUse = customClientId.trim() || defaultClientId;
-    if (!clientToUse) {
-      setErrorMsg('Masukkan Google OAuth Client ID terlebih dahulu.');
-      return;
-    }
-
-    setIsSubmitting(true);
-    try {
-      saveDriveAuthConfig({
-        ...getSavedDriveAuthConfig(),
-        customClientId: customClientId.trim(),
-      });
-      const result = await signInWithGoogleGIS(clientToUse);
-      onConnected(result.user, result.accessToken);
-      onClose();
-    } catch (err: any) {
-      setErrorMsg(err?.message || 'Gagal login dengan Google Identity Services (GIS).');
     } finally {
       setIsSubmitting(false);
     }
@@ -143,16 +127,16 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
         <div className="flex items-start justify-between gap-4 pb-4 border-b border-current/10">
           <div className="min-w-0">
             <div className="flex items-center gap-2 text-xs font-mono font-semibold mb-1">
-              <CloudUpload className={`w-4 h-4 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
+              <Sparkles className={`w-4 h-4 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
               <span className={isDark ? 'text-red-400' : 'text-blue-600'}>
-                KONFIGURASI LOGIN GOOGLE DRIVE (SUPPORT VERCEL &amp; CUSTOM DOMAIN)
+                PENAUTAN CEPAT GOOGLE DRIVE (ANTI-RIBET &amp; SUPPORT VERCEL 100%)
               </span>
             </div>
             <h2 id="gdrive-vercel-modal-title" className="text-lg sm:text-xl font-bold tracking-tight">
-              Solusi Login Google Drive Saat Deploy di Vercel
+              Tautkan Folder Google Drive Tanpa Login OAuth
             </h2>
             <p className={`text-xs mt-1 leading-relaxed ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
-              Domain saat ini terdeteksi sebagai <code className="font-mono font-semibold">{currentHostname}</code>. Pilih salah satu dari 3 metode di bawah agar koneksi Google Drive langsung berfungsi di Vercel.
+              Cara paling simpel dan permanen untuk menyimpan backup ke Google Drive Anda (termasuk Auto-Update) tanpa perlu setting Firebase / Cloud Console saat di-deploy ke Vercel.
             </p>
           </div>
           <button
@@ -184,15 +168,15 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
 
         {/* Mode Switcher Tabs */}
         <div
-          className={`grid grid-cols-1 sm:grid-cols-3 gap-1.5 p-1.5 mt-5 rounded-xl border ${
+          className={`grid grid-cols-1 sm:grid-cols-2 gap-1.5 p-1.5 mt-5 rounded-xl border ${
             isDark ? 'bg-[#09090B] border-[#242429]' : 'bg-slate-100 border-slate-200'
           }`}
         >
           <button
             type="button"
-            onClick={() => setActiveTab('instant_token')}
-            className={`px-3 py-2 text-xs font-semibold rounded-lg text-left sm:text-center transition-colors ${
-              activeTab === 'instant_token'
+            onClick={() => setActiveTab('simple_bridge')}
+            className={`px-3 py-2 text-xs font-semibold rounded-lg text-center transition-colors ${
+              activeTab === 'simple_bridge'
                 ? isDark
                   ? 'bg-red-600 text-white'
                   : 'bg-blue-600 text-white'
@@ -201,13 +185,13 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            1. Token Langsung (Tanpa Whitelist)
+            Cara Paling Mudah: Link Google Script (Permanen Selamanya)
           </button>
           <button
             type="button"
-            onClick={() => setActiveTab('custom_client')}
-            className={`px-3 py-2 text-xs font-semibold rounded-lg text-left sm:text-center transition-colors ${
-              activeTab === 'custom_client'
+            onClick={() => setActiveTab('direct_token')}
+            className={`px-3 py-2 text-xs font-semibold rounded-lg text-center transition-colors ${
+              activeTab === 'direct_token'
                 ? isDark
                   ? 'bg-red-600 text-white'
                   : 'bg-blue-600 text-white'
@@ -216,27 +200,171 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
                 : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            2. Google OAuth Client ID (GIS)
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('firebase_domain')}
-            className={`px-3 py-2 text-xs font-semibold rounded-lg text-left sm:text-center transition-colors ${
-              activeTab === 'firebase_domain'
-                ? isDark
-                  ? 'bg-red-600 text-white'
-                  : 'bg-blue-600 text-white'
-                : isDark
-                ? 'text-zinc-400 hover:text-white'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            3. Whitelist Domain Vercel
+            Alternatif: Tempel Access Token (OAuth Playground)
           </button>
         </div>
 
-        {/* TAB 1: INSTANT ACCESS TOKEN / REFRESH TOKEN (WORKS ON ANY VERCEL URL WITHOUT DOMAIN WHITELIST) */}
-        {activeTab === 'instant_token' && (
+        {/* TAB 1: SUPER SIMPLE 1-LINK GOOGLE DRIVE BRIDGE */}
+        {activeTab === 'simple_bridge' && (
+          <form onSubmit={handleConnectBridge} className="mt-5 space-y-4">
+            {/* Step 1: Optional Folder Link */}
+            <div>
+              <label htmlFor="gdrive-folder-link" className="block text-xs font-semibold mb-1.5">
+                1. Link Folder Google Drive Tujuan <span className="font-normal opacity-70">(Opsional — Kosongkan agar otomatis membuat folder PteroVault_Backups)</span>
+              </label>
+              <div className="relative">
+                <FolderOpen
+                  className={`w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 ${
+                    isDark ? 'text-zinc-500' : 'text-slate-400'
+                  }`}
+                />
+                <input
+                  id="gdrive-folder-link"
+                  type="text"
+                  value={targetFolderUrl}
+                  onChange={(e) => setTargetFolderUrl(e.target.value)}
+                  placeholder="Contoh: https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRs..."
+                  className={`w-full pl-10 pr-3.5 py-2.5 text-xs rounded-lg border font-mono transition-colors ${
+                    isDark
+                      ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
+                      : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
+                  }`}
+                />
+              </div>
+            </div>
+
+            {/* Step 2: 1-Click Copy Script & Open script.google.com */}
+            <div
+              className={`p-4 rounded-xl border space-y-3 ${
+                isDark
+                  ? 'bg-[#09090B] border-[#242429] text-zinc-300'
+                  : 'bg-slate-50 border-slate-200 text-slate-700'
+              }`}
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div className="text-xs font-semibold">
+                  2. Salin Kode Jembatan Google Drive (Hanya 1x Seumur Hidup):
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleCopyScript}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold text-white inline-flex items-center gap-1.5 transition-colors ${
+                      copiedScript
+                        ? 'bg-emerald-600'
+                        : isDark
+                        ? 'bg-red-600 hover:bg-red-500'
+                        : 'bg-blue-600 hover:bg-blue-700'
+                    }`}
+                  >
+                    {copiedScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedScript ? 'Kode Berhasil Disalin!' : 'Salin Kode Otomatis (1-Klik)'}
+                  </button>
+                  <a
+                    href="https://script.google.com/home/start"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`px-3 py-1.5 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors ${
+                      isDark
+                        ? 'border-[#27272A] bg-zinc-900 text-zinc-200 hover:bg-zinc-800'
+                        : 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100'
+                    }`}
+                  >
+                    Buka script.google.com
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+              </div>
+
+              <ol className="list-decimal list-inside text-xs space-y-1 opacity-90 leading-relaxed">
+                <li>
+                  Klik <strong>Salin Kode Otomatis</strong> di atas, lalu buka <strong>script.google.com</strong> dan klik <strong>New Project (Proyek Baru)</strong>.
+                </li>
+                <li>
+                  Hapus isi awal lalu <strong>Paste (Ctrl+V)</strong> kode tadi.
+                </li>
+                <li>
+                  Klik tombol biru <strong>Deploy &rarr; New deployment</strong>, pilih jenis <strong>Web app</strong>, ubah <em>Who has access</em> menjadi <strong>Anyone (Siapa saja)</strong>, lalu klik <strong>Deploy</strong>.
+                </li>
+                <li>
+                  Salin <strong>Web App URL</strong> (<code className="font-mono">https://script.google.com/macros/s/.../exec</code>) dan tempel di kolom nomor 3 di bawah!
+                </li>
+              </ol>
+
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowScriptPreview(!showScriptPreview)}
+                  className="text-[11px] underline opacity-75 hover:opacity-100"
+                >
+                  {showScriptPreview ? 'Sembunyikan Isi Kode Script' : 'Lihat Isi Kode Script (25 Baris)'}
+                </button>
+                {showScriptPreview && (
+                  <pre
+                    className={`mt-2 p-3 rounded-lg border text-[11px] font-mono overflow-x-auto max-h-44 ${
+                      isDark ? 'bg-[#121215] border-[#27272A] text-zinc-300' : 'bg-white border-slate-200 text-slate-800'
+                    }`}
+                  >
+                    {generatedScriptCode}
+                  </pre>
+                )}
+              </div>
+            </div>
+
+            {/* Step 3: Paste Web App URL */}
+            <div>
+              <label htmlFor="gdrive-script-url" className="block text-xs font-semibold mb-1.5">
+                3. Tempel Web App URL Google Script Anda (<code className="font-mono">https://script.google.com/macros/s/.../exec</code>)
+              </label>
+              <div className="relative">
+                <Link2
+                  className={`w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 ${
+                    isDark ? 'text-zinc-500' : 'text-slate-400'
+                  }`}
+                />
+                <input
+                  id="gdrive-script-url"
+                  type="url"
+                  value={appsScriptUrl}
+                  onChange={(e) => setAppsScriptUrl(e.target.value)}
+                  placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+                  className={`w-full pl-10 pr-3.5 py-2.5 text-xs rounded-lg border font-mono transition-colors ${
+                    isDark
+                      ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
+                      : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
+                  }`}
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className={`px-4 py-2 text-xs font-medium rounded-lg border ${
+                  isDark
+                    ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
+                    : 'border-slate-200 text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                Batal
+              </button>
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className={`px-5 py-2.5 text-xs font-semibold text-white rounded-lg inline-flex items-center gap-2 transition-colors ${
+                  isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                <CloudUpload className="w-4 h-4" />
+                {isSubmitting ? 'Menghubungkan ke Google Drive...' : 'Hubungkan Google Drive Permanen'}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* TAB 2: DIRECT OAUTH PLAYGROUND TOKEN */}
+        {activeTab === 'direct_token' && (
           <form onSubmit={handleConnectDirectToken} className="mt-5 space-y-4">
             <div
               className={`p-3.5 rounded-lg border text-xs leading-relaxed ${
@@ -245,11 +373,7 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
                   : 'bg-slate-50 border-slate-200 text-slate-700'
               }`}
             >
-              <div className="font-semibold mb-1 flex items-center gap-1.5">
-                <ShieldCheck className={`w-4 h-4 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
-                Cara Tercepat di Vercel (Bebas Error Unauthorized Domain):
-              </div>
-              <ol className="list-decimal list-inside space-y-1 opacity-90">
+              <ol className="list-decimal list-inside space-y-1">
                 <li>
                   Buka{' '}
                   <a
@@ -257,156 +381,41 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
                     target="_blank"
                     rel="noopener noreferrer"
                     className={`underline font-semibold inline-flex items-center gap-1 ${
-                      isDark ? 'text-red-400 hover:text-red-300' : 'text-blue-600 hover:text-blue-700'
+                      isDark ? 'text-red-400' : 'text-blue-600'
                     }`}
                   >
-                    Google OAuth 2.0 Playground (Klik di Sini)
+                    Google OAuth Playground (Klik di Sini)
                     <ExternalLink className="w-3 h-3" />
                   </a>
                 </li>
                 <li>
-                  Klik tombol biru <strong>Authorize APIs</strong> lalu pilih akun Google Drive Anda.
+                  Klik <strong>Authorize APIs</strong> &rarr; <strong>Exchange authorization code for tokens</strong>.
                 </li>
                 <li>
-                  Klik <strong>Exchange authorization code for tokens</strong>, lalu salin <strong>Access token</strong> (<code className="font-mono">ya29...</code>) ke kolom di bawah.
+                  Salin <strong>Access token</strong> (<code className="font-mono">ya29...</code>) dan tempel di bawah.
                 </li>
               </ol>
             </div>
 
             <div>
               <label htmlFor="gdrive-direct-token" className="block text-xs font-semibold mb-1.5">
-                Google Drive Access Token (<code className="font-mono">ya29.a0...</code>)
+                Access Token Google Drive (<code className="font-mono">ya29.a0...</code>)
               </label>
               <input
                 id="gdrive-direct-token"
                 type="password"
                 value={directAccessToken}
                 onChange={(e) => setDirectAccessToken(e.target.value)}
-                placeholder="Tempelkan Access Token (ya29.a0...) dari OAuth Playground"
-                className={`w-full px-3.5 py-2.5 text-xs rounded-lg border font-mono transition-colors ${
-                  isDark
-                    ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
-                    : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
-                }`}
-              />
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-current/10">
-              <div>
-                <label htmlFor="gdrive-refresh-token" className="block text-xs font-medium mb-1">
-                  Refresh Token <span className="opacity-60">(Opsional - Auto-Renew 24/7)</span>
-                </label>
-                <input
-                  id="gdrive-refresh-token"
-                  type="password"
-                  value={refreshToken}
-                  onChange={(e) => setRefreshToken(e.target.value)}
-                  placeholder="1//04..."
-                  className={`w-full px-3 py-2 text-xs rounded-lg border font-mono ${
-                    isDark
-                      ? 'bg-[#09090B] border-[#27272A] text-zinc-100'
-                      : 'bg-slate-50 border-slate-300 text-slate-900'
-                  }`}
-                />
-              </div>
-              <div>
-                <label htmlFor="gdrive-client-secret" className="block text-xs font-medium mb-1">
-                  Client Secret <span className="opacity-60">(Opsional jika pakai Refresh Token)</span>
-                </label>
-                <input
-                  id="gdrive-client-secret"
-                  type="password"
-                  value={clientSecret}
-                  onChange={(e) => setClientSecret(e.target.value)}
-                  placeholder="GOCSPX-..."
-                  className={`w-full px-3 py-2 text-xs rounded-lg border font-mono ${
-                    isDark
-                      ? 'bg-[#09090B] border-[#27272A] text-zinc-100'
-                      : 'bg-slate-50 border-slate-300 text-slate-900'
-                  }`}
-                />
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-end gap-2.5 pt-3">
-              <button
-                type="button"
-                onClick={onClose}
-                className={`px-4 py-2 text-xs font-medium rounded-lg border ${
-                  isDark
-                    ? 'border-[#27272A] text-zinc-300 hover:bg-zinc-800'
-                    : 'border-slate-200 text-slate-700 hover:bg-slate-100'
-                }`}
-              >
-                Batal
-              </button>
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className={`px-4 py-2 text-xs font-semibold text-white rounded-lg inline-flex items-center gap-2 transition-colors ${
-                  isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
-                }`}
-              >
-                <KeyRound className="w-3.5 h-3.5" />
-                {isSubmitting ? 'Memverifikasi Token...' : 'Verifikasi & Hubungkan Google Drive'}
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* TAB 2: CUSTOM GOOGLE OAUTH CLIENT ID (GIS POPUP FOR VERCEL) */}
-        {activeTab === 'custom_client' && (
-          <form onSubmit={handleConnectGisPopup} className="mt-5 space-y-4">
-            <div
-              className={`p-3.5 rounded-lg border text-xs leading-relaxed ${
-                isDark
-                  ? 'bg-[#09090B] border-[#242429] text-zinc-300'
-                  : 'bg-slate-50 border-slate-200 text-slate-700'
-              }`}
-            >
-              <p className="font-semibold mb-1">
-                Login Popup Langsung via Google Identity Services (Tanpa Firebase Auth):
-              </p>
-              <p className="opacity-90">
-                Jika Anda membuat <strong>OAuth 2.0 Client ID (Web Application)</strong> di Google Cloud Console sendiri, tambahkan URL Vercel Anda di bagian <strong>Authorized JavaScript origins</strong> lalu tempelkan Client ID-nya di bawah.
-              </p>
-              <div className="mt-2.5 flex items-center justify-between gap-2 p-2 rounded border border-current/15 font-mono text-[11px]">
-                <span className="truncate">Origin Vercel Anda: {currentOrigin}</span>
-                <button
-                  type="button"
-                  onClick={() => handleCopy(currentOrigin, 'origin')}
-                  className={`px-2 py-1 rounded text-[11px] font-sans font-semibold inline-flex items-center gap-1 shrink-0 ${
-                    isDark ? 'bg-zinc-800 text-zinc-200' : 'bg-white border border-slate-200 text-slate-700'
-                  }`}
-                >
-                  {copiedField === 'origin' ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                  {copiedField === 'origin' ? 'Tersalin' : 'Salin URL'}
-                </button>
-              </div>
-            </div>
-
-            <div>
-              <label htmlFor="custom-google-client-id" className="block text-xs font-semibold mb-1.5">
-                Google OAuth 2.0 Client ID (<code className="font-mono">*.apps.googleusercontent.com</code>)
-              </label>
-              <input
-                id="custom-google-client-id"
-                type="text"
-                value={customClientId}
-                onChange={(e) => setCustomClientId(e.target.value)}
-                placeholder={defaultClientId || '1234567890-abcdefg.apps.googleusercontent.com'}
+                placeholder="ya29.a0..."
                 className={`w-full px-3.5 py-2.5 text-xs rounded-lg border font-mono ${
                   isDark
-                    ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
-                    : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
+                    ? 'bg-[#09090B] border-[#27272A] text-zinc-100'
+                    : 'bg-slate-50 border-slate-300 text-slate-900'
                 }`}
               />
-              <p className={`text-[11px] mt-1 ${isDark ? 'text-zinc-500' : 'text-slate-500'}`}>
-                Kosongkan untuk mencoba menggunakan Client ID bawaan proyek ({defaultClientId.slice(0, 22)}...).
-              </p>
             </div>
 
-            <div className="flex flex-wrap items-center justify-end gap-2.5 pt-3">
+            <div className="flex flex-wrap items-center justify-end gap-2.5 pt-2">
               <button
                 type="button"
                 onClick={onClose}
@@ -421,89 +430,15 @@ export const GoogleDriveConfigModal: React.FC<GoogleDriveConfigModalProps> = ({
               <button
                 type="submit"
                 disabled={isSubmitting}
-                className={`px-4 py-2 text-xs font-semibold text-white rounded-lg inline-flex items-center gap-2 transition-colors ${
+                className={`px-5 py-2.5 text-xs font-semibold text-white rounded-lg inline-flex items-center gap-2 ${
                   isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
                 }`}
               >
-                <Globe className="w-3.5 h-3.5" />
-                {isSubmitting ? 'Membuka Popup Google...' : 'Simpan & Login Popup Google (GIS)'}
+                <CloudUpload className="w-4 h-4" />
+                {isSubmitting ? 'Memverifikasi...' : 'Hubungkan dengan Token'}
               </button>
             </div>
           </form>
-        )}
-
-        {/* TAB 3: WHITELIST VERCEL DOMAIN IN FIREBASE CONSOLE */}
-        {activeTab === 'firebase_domain' && (
-          <div className="mt-5 space-y-4 text-xs">
-            <div
-              className={`p-4 rounded-lg border leading-relaxed space-y-3 ${
-                isDark
-                  ? 'bg-[#09090B] border-[#242429] text-zinc-300'
-                  : 'bg-slate-50 border-slate-200 text-slate-700'
-              }`}
-            >
-              <p className="font-semibold">
-                Mengapa tombol Sign in with Google menolak domain Vercel secara default?
-              </p>
-              <p className="opacity-90">
-                Keamanan Firebase Authentication memblokir popup login dari domain baru (<code className="font-mono">auth/unauthorized-domain</code>) sampai domain Vercel Anda ditambahkan ke daftar <strong>Authorized domains</strong>.
-              </p>
-
-              <div className="p-2.5 rounded-lg border border-current/15 flex items-center justify-between gap-2 font-mono">
-                <span className="truncate font-semibold">{currentHostname}</span>
-                <button
-                  type="button"
-                  onClick={() => handleCopy(currentHostname, 'hostname')}
-                  className={`px-2.5 py-1 rounded text-xs font-sans font-semibold inline-flex items-center gap-1 shrink-0 ${
-                    isDark ? 'bg-red-600 text-white' : 'bg-blue-600 text-white'
-                  }`}
-                >
-                  {copiedField === 'hostname' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedField === 'hostname' ? 'Domain Tersalin!' : 'Salin Domain Vercel'}
-                </button>
-              </div>
-
-              <ol className="list-decimal list-inside space-y-1.5 pt-1">
-                <li>
-                  Salin domain <code className="font-mono font-semibold">{currentHostname}</code> di atas.
-                </li>
-                <li>
-                  Buka{' '}
-                  <a
-                    href={`https://console.firebase.google.com/project/${defaultProjectId}/authentication/settings`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={`underline font-semibold inline-flex items-center gap-1 ${
-                      isDark ? 'text-red-400' : 'text-blue-600'
-                    }`}
-                  >
-                    Firebase Console &rarr; Authentication &rarr; Settings &rarr; Authorized domains
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </li>
-                <li>
-                  Klik <strong>Add domain</strong>, tempelkan <code className="font-mono">{currentHostname}</code>, lalu simpan.
-                </li>
-                <li>
-                  Atau jika Anda tidak ingin mengatur Firebase Console, gunakan <strong>Tab 1 (Token Langsung)</strong> di atas yang langsung berjalan di Vercel tanpa whitelist domain.
-                </li>
-              </ol>
-            </div>
-
-            <div className="flex justify-end pt-2">
-              <button
-                type="button"
-                onClick={onClose}
-                className={`px-4 py-2 text-xs font-semibold rounded-lg border ${
-                  isDark
-                    ? 'border-[#27272A] text-zinc-200 hover:bg-zinc-800'
-                    : 'border-slate-200 text-slate-700 hover:bg-slate-100'
-                }`}
-              >
-                Tutup
-              </button>
-            </div>
-          </div>
         )}
       </div>
     </div>

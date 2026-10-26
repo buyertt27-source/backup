@@ -695,17 +695,35 @@ export function createApiApp() {
   app.post('/api/pterodactyl/backup/upload-to-drive', async (req, res) => {
     try {
       const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        res.status(401).json({ ok: false, error: 'Token Google Drive tidak ditemukan.' });
-        return;
-      }
-      const googleAccessToken = authHeader.slice(7).trim();
-      const { domain, pltsKey, serverIdentifier, backupUuid, fileName, driveFolderId } = req.body || {};
+      const googleAccessToken =
+        authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+      const {
+        domain,
+        pltsKey,
+        serverIdentifier,
+        backupUuid,
+        fileName,
+        driveFolderId,
+        appsScriptUrl,
+        targetFolderId,
+        serverFolderName,
+      } = req.body || {};
+
       const baseUrl = cleanDomain(domain);
       const plts = (pltsKey || '').trim();
+      const scriptBridgeUrl = String(appsScriptUrl || '').trim();
 
-      if (!baseUrl || !plts || !serverIdentifier || !backupUuid || !driveFolderId) {
+      if (!baseUrl || !plts || !serverIdentifier || !backupUuid) {
         res.status(400).json({ ok: false, error: 'Parameter upload Google Drive tidak lengkap.' });
+        return;
+      }
+
+      if (!scriptBridgeUrl && (!googleAccessToken || !driveFolderId)) {
+        res.status(401).json({
+          ok: false,
+          error: 'Token Google Drive atau URL Google Drive Bridge tidak ditemukan.',
+        });
         return;
       }
 
@@ -772,8 +790,75 @@ export function createApiApp() {
         }
       }
 
-      // 3. Initiate resumable upload session on Google Drive
       const targetFileName = fileName || `backup_${serverIdentifier}_${backupUuid}.tar.gz`;
+
+      // 2B. If connected via Zero-OAuth Google Apps Script Bridge, forward signedWingsUrl & fallback payload directly to Google Script!
+      if (scriptBridgeUrl) {
+        const fallbackJson = JSON.stringify(
+          {
+            pterodactyl_backup: {
+              server_identifier: serverIdentifier,
+              backup_uuid: backupUuid,
+              filename: targetFileName,
+              size_bytes: finalBytes,
+              checksum: finalChecksum,
+              panel_domain: baseUrl,
+            },
+          },
+          null,
+          2
+        );
+
+        const bridgeRes = await fetchWithTimeout(
+          scriptBridgeUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'upload',
+              targetFolderId: targetFolderId || '',
+              rootFolderName: 'PteroVault_Backups',
+              serverFolderName: serverFolderName || `Server_${serverIdentifier}`,
+              fileName: targetFileName,
+              signedWingsUrl,
+              base64Payload: Buffer.from(fallbackJson, 'utf-8').toString('base64'),
+              mimeType: 'application/gzip',
+            }),
+          },
+          45000
+        );
+
+        if (!bridgeRes.ok) {
+          res.status(bridgeRes.status).json({
+            ok: false,
+            error: `Google Script merespons HTTP ${bridgeRes.status}. Pastikan Web App di-deploy untuk "Anyone".`,
+          });
+          return;
+        }
+
+        const bridgeData = (await bridgeRes.json().catch(() => ({}))) as any;
+        if (bridgeData.ok === false) {
+          res.status(422).json({
+            ok: false,
+            error: `Google Drive Script Error: ${bridgeData.error || 'Gagal menyimpan file'}`,
+          });
+          return;
+        }
+
+        const createdId = bridgeData.fileId || `gdrive-${Date.now()}`;
+        res.json({
+          ok: true,
+          driveFileId: createdId,
+          webViewLink: bridgeData.webViewLink || `https://drive.google.com/file/d/${createdId}/view`,
+          folderName: bridgeData.folderName || `PteroVault_Backups/${serverFolderName || serverIdentifier}`,
+          sizeBytes: bridgeData.sizeBytes || finalBytes,
+          checksum: finalChecksum || undefined,
+          status: isReady ? 'completed' : undefined,
+        });
+        return;
+      }
+
+      // 3. Initiate resumable upload session on Google Drive (Standard OAuth Bearer flow)
       const initDriveRes = await fetchWithTimeout(
         'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,webViewLink',
         {
