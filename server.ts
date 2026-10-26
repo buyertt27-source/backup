@@ -1,7 +1,9 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
+
+// Allow connecting to Pterodactyl panels with self-signed SSL certificates
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,7 +38,12 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 1
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const mergedHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      ...((options.headers as Record<string, string>) || {}),
+    };
+    return await fetch(url, { ...options, headers: mergedHeaders, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -1007,6 +1014,7 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

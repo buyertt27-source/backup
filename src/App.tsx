@@ -23,6 +23,7 @@ import {
   connectWithAppsScriptBridge,
 } from './services/googleDriveAuth';
 import { uploadBackupToGoogleDrive } from './services/googleDriveService';
+import { callPteroApi } from './services/pterodactylClient';
 import { ApiKeyConfigModal } from './components/ApiKeyConfigModal';
 import { GoogleDriveConfigModal } from './components/GoogleDriveConfigModal';
 import { ServerBackupCard } from './components/ServerBackupCard';
@@ -443,15 +444,11 @@ export function App() {
 
       setIsSyncingPanel(true);
       try {
-        const response = await fetch('/api/pterodactyl/sync', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(credsToUse),
-        });
-        const data = await response.json();
+        const { ok, status, data } = await callPteroApi('sync', credsToUse as any);
 
-        if (!response.ok || !data.ok) {
-          const errMsg = data.error || `Gagal terhubung ke panel ${credsToUse.domain} (HTTP ${response.status}).`;
+        if (!ok || !data?.ok) {
+          const errMsg =
+            data?.error || `Gagal terhubung ke panel ${credsToUse.domain} (HTTP ${status}).`;
           appendLog('Gagal Sinkronisasi Panel', credsToUse.domain, errMsg, 'error');
           showNotice(errMsg, 'error');
           return { ok: false, message: errMsg };
@@ -473,7 +470,7 @@ export function App() {
         showNotice(msg, 'success');
         return { ok: true, message: msg };
       } catch (err: any) {
-        const errMsg = `Kesalahan jaringan saat menghubungi server proxy: ${err?.message || 'Unknown error'}`;
+        const errMsg = `Gagal menghubungkan ke panel ${credsToUse.domain}: ${err?.message || 'Periksa koneksi internet dan domain panel Anda.'}`;
         appendLog('Error Jaringan API', credsToUse.domain, errMsg, 'error');
         showNotice(errMsg, 'error');
         return { ok: false, message: errMsg };
@@ -536,26 +533,21 @@ export function App() {
 
       setBackingUpIds((prev) => [...prev, serverId]);
       try {
-        const response = await fetch('/api/pterodactyl/backup/create', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            domain: credentials.domain,
-            pltsKey: credentials.pltsKey,
-            serverIdentifier: targetSrv.identifier,
-            serverOrdinal: srvIdx + 1,
-            serverName: targetSrv.name,
-            isLocked: schedule.lockNewBackups,
-            autoDeletePrevious: shouldAutoDeletePrevious,
-            autoDeleteStrategy: effectiveDeleteStrategy,
-            retentionCount: effectiveRetentionCount,
-            serverBackupLimit: targetSrv.limits.backupLimit,
-          }),
+        const { ok, data } = await callPteroApi('backup/create', {
+          domain: credentials.domain,
+          pltsKey: credentials.pltsKey,
+          serverIdentifier: targetSrv.identifier,
+          serverOrdinal: srvIdx + 1,
+          serverName: targetSrv.name,
+          isLocked: schedule.lockNewBackups,
+          autoDeletePrevious: shouldAutoDeletePrevious,
+          autoDeleteStrategy: effectiveDeleteStrategy,
+          retentionCount: effectiveRetentionCount,
+          serverBackupLimit: targetSrv.limits.backupLimit,
         });
 
-        const data = await response.json();
-        if (!response.ok || !data.ok) {
-          const errMsg = data.error || `Gagal membuat backup pada ${targetSrv.name}`;
+        if (!ok || !data?.ok) {
+          const errMsg = data?.error || `Gagal membuat backup pada ${targetSrv.name}`;
           appendLog('Gagal Backup Server', targetSrv.name, errMsg, 'error');
           showNotice(errMsg, 'error');
           return false;
@@ -781,19 +773,14 @@ export function App() {
 
     try {
       showNotice(`Meminta signed link unduhan untuk ${backup.fileName} dari panel...`, 'info');
-      const response = await fetch('/api/pterodactyl/backup/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domain: credentials.domain,
-          pltsKey: credentials.pltsKey,
-          serverIdentifier: backup.serverIdentifier,
-          backupUuid: backup.uuid,
-        }),
+      const { ok, data } = await callPteroApi('backup/download', {
+        domain: credentials.domain,
+        pltsKey: credentials.pltsKey,
+        serverIdentifier: backup.serverIdentifier,
+        backupUuid: backup.uuid,
       });
-      const data = await response.json();
-      if (!response.ok || !data.ok || !data.downloadUrl) {
-        showNotice(data.error || 'Gagal mendapatkan URL download dari Pterodactyl.', 'error');
+      if (!ok || !data?.ok || !data?.downloadUrl) {
+        showNotice(data?.error || 'Gagal mendapatkan URL download dari Pterodactyl.', 'error');
         return;
       }
 
@@ -821,19 +808,14 @@ export function App() {
     if (!targetSrv || !targetBkp) return;
 
     try {
-      const response = await fetch('/api/pterodactyl/backup/lock', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domain: credentials.domain,
-          pltsKey: credentials.pltsKey,
-          serverIdentifier: targetSrv.identifier,
-          backupUuid: targetBkp.uuid,
-        }),
+      const { ok, data } = await callPteroApi('backup/lock', {
+        domain: credentials.domain,
+        pltsKey: credentials.pltsKey,
+        serverIdentifier: targetSrv.identifier,
+        backupUuid: targetBkp.uuid,
       });
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        showNotice(data.error || 'Gagal mengubah status kunci backup di panel.', 'error');
+      if (!ok || !data?.ok) {
+        showNotice(data?.error || 'Gagal mengubah status kunci backup di panel.', 'error');
         return;
       }
 
@@ -878,19 +860,14 @@ export function App() {
     setPendingDelete(null);
 
     try {
-      const response = await fetch('/api/pterodactyl/backup/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          domain: credentials.domain,
-          pltsKey: credentials.pltsKey,
-          serverIdentifier: backup.serverIdentifier,
-          backupUuid: backup.uuid,
-        }),
+      const { ok, data } = await callPteroApi('backup/delete', {
+        domain: credentials.domain,
+        pltsKey: credentials.pltsKey,
+        serverIdentifier: backup.serverIdentifier,
+        backupUuid: backup.uuid,
       });
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        showNotice(data.error || 'Gagal menghapus backup dari panel Pterodactyl.', 'error');
+      if (!ok || !data?.ok) {
+        showNotice(data?.error || 'Gagal menghapus backup dari panel Pterodactyl.', 'error');
         return;
       }
 

@@ -1,5 +1,6 @@
 import { PteroBackupFile } from '../types/pterodactyl';
 import { buildBackupManifestContent } from '../utils/backupLogic';
+import { callPteroApi } from './pterodactylClient';
 
 /**
  * Formats the isolated Google Drive folder name for a specific Pterodactyl server
@@ -155,6 +156,23 @@ export async function uploadBackupToGoogleDrive(params: {
     }
 
     // 1B. Direct client-side POST to Google Apps Script Web App (uses text/plain for CORS-safe execution)
+    let signedWingsUrl = '';
+    if (domain && pltsKey && backup.uuid && !backup.uuid.startsWith('drive-test-')) {
+      try {
+        const dlRes = await callPteroApi('backup/download', {
+          domain,
+          pltsKey,
+          serverIdentifier: backup.serverIdentifier,
+          backupUuid: backup.uuid,
+        });
+        if (dlRes.ok && dlRes.data?.downloadUrl) {
+          signedWingsUrl = dlRes.data.downloadUrl;
+        }
+      } catch {
+        // Ignore signed URL fallback error
+      }
+    }
+
     const manifestContent = buildBackupManifestContent(backup, domain);
     const base64Payload = btoa(unescape(encodeURIComponent(manifestContent)));
 
@@ -169,6 +187,7 @@ export async function uploadBackupToGoogleDrive(params: {
         rootFolderName: 'PteroVault_Backups',
         serverFolderName,
         fileName: backup.fileName,
+        signedWingsUrl: signedWingsUrl || undefined,
         base64Payload,
         mimeType: 'application/gzip',
       }),

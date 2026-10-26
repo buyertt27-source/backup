@@ -394,6 +394,21 @@ function doPost(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
 
+    if (data.action === "ptero_proxy" && data.targetUrl) {
+      var pteroRes = UrlFetchApp.fetch(data.targetUrl, {
+        method: data.method || "get",
+        headers: data.headers || {},
+        payload: data.payload ? JSON.stringify(data.payload) : undefined,
+        contentType: "application/json",
+        muteHttpExceptions: true
+      });
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: pteroRes.getResponseCode() >= 200 && pteroRes.getResponseCode() < 300,
+        status: pteroRes.getResponseCode(),
+        body: pteroRes.getContentText()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
     var subName = data.serverFolderName || "Server_01";
     var subs = rootFolder.getFoldersByName(subName);
     var subFolder = subs.hasNext() ? subs.next() : rootFolder.createFolder(subName);

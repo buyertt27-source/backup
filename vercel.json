@@ -1,8 +1,8 @@
 {
   "rewrites": [
     {
-      "source": "/api/(.*)",
-      "destination": "/api/index"
+      "source": "/api/pterodactyl/(.*)",
+      "destination": "/api/pterodactyl?action=$1"
     },
     {
       "source": "/((?!api/).*)",
