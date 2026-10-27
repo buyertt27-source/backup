@@ -11,6 +11,7 @@ import { INITIAL_SERVERS, INITIAL_SCHEDULE, INITIAL_LOGS } from './data/initialS
 import {
   formatBytes,
   calculateNextScheduleRun,
+  ensureFutureNextRunAt,
   selectBackupsToAutoDelete,
   buildGoogleAppsScriptCode,
   createBackupEntryForServer,
@@ -24,7 +25,13 @@ import {
   connectWithAppsScriptBridge,
 } from './services/googleDriveAuth';
 import { uploadBackupToGoogleDrive } from './services/googleDriveService';
-import { callPteroApi, waitForPteroBackupCompletion } from './services/pterodactylClient';
+import {
+  callPteroApi,
+  waitForPteroBackupCompletion,
+  syncAutoBackupDaemon,
+  fetchAutoBackupDaemonStatus,
+  createBackgroundTimerWorker,
+} from './services/pterodactylClient';
 import { ApiKeyConfigModal } from './components/ApiKeyConfigModal';
 import { GoogleDriveConfigModal } from './components/GoogleDriveConfigModal';
 import { ServerBackupCard } from './components/ServerBackupCard';
@@ -87,17 +94,32 @@ export function App() {
     return INITIAL_SERVERS;
   });
 
+  const missedOfflineCycleRef = useRef<boolean>(false);
+
   const [schedule, setSchedule] = useState<AutoBackupSchedule>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEYS.SCHEDULE);
       if (saved) {
         const parsed = JSON.parse(saved);
-        return {
+        const merged: AutoBackupSchedule = {
           ...INITIAL_SCHEDULE,
           ...parsed,
+          frequency:
+            parsed.frequency === 'daily' || parsed.frequency === 'weekly'
+              ? parsed.frequency
+              : 'interval_hours',
+          intervalHours: Number(parsed.intervalHours) > 0 ? Number(parsed.intervalHours) : 1,
           saveToGoogleDrive: parsed.saveToGoogleDrive ?? true,
           autoDeletePrevious: parsed.autoDeletePrevious ?? true,
           autoDeleteStrategy: parsed.autoDeleteStrategy || 'delete_all_previous',
+        };
+        const aligned = ensureFutureNextRunAt(merged, new Date());
+        if (merged.enabled && aligned.wasDue) {
+          missedOfflineCycleRef.current = true;
+        }
+        return {
+          ...merged,
+          nextRunAt: aligned.nextRunAt,
         };
       }
     } catch {
@@ -902,23 +924,174 @@ export function App() {
     [servers, credentials, handleBackupSingleServer, handleVerifyDriveBackupNow, showNotice]
   );
 
-  // Real background timer that checks every 3 seconds if Auto-Update schedule is due
+  // Real background timer using Web Worker (immune to browser background tab throttling)
   const scheduleRef = useRef(schedule);
   scheduleRef.current = schedule;
   const triggerScheduleRef = useRef(handleTriggerScheduledRunNow);
   triggerScheduleRef.current = handleTriggerScheduledRunNow;
 
+  // Keep 24/7 Server Daemon & Google Apps Script Cloud Cron in sync whenever schedule/credentials change
   useEffect(() => {
-    const timer = setInterval(() => {
-      const cur = scheduleRef.current;
-      if (!cur.enabled || isRunningScheduleRef.current) return;
-      const nowMs = Date.now();
-      const nextMs = new Date(cur.nextRunAt).getTime();
-      if (!Number.isFinite(nextMs) || nowMs >= nextMs) {
-        triggerScheduleRef.current();
+    syncAutoBackupDaemon({
+      schedule,
+      credentials,
+      googleAccessToken: googleToken,
+    }).catch(() => {});
+  }, [schedule, credentials, googleToken]);
+
+  // Poll 24/7 Background Daemon & Cloud Cron status on startup and periodically so backups completed
+  // while the user was NOT in the panel are reflected immediately and nextRunAt is never stuck at 00:00:00
+  const syncedRunIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    let mounted = true;
+
+    const pullDaemonUpdates = async () => {
+      const status = await fetchAutoBackupDaemonStatus();
+      if (!mounted || !status) return;
+
+      if (status.lastCronRunAt) {
+        setSchedule((prev) => {
+          const prevLast = prev.lastRunAt ? new Date(prev.lastRunAt).getTime() : 0;
+          const cronLast = new Date(status.lastCronRunAt!).getTime();
+          if (Number.isFinite(cronLast) && cronLast > prevLast) {
+            const aligned = ensureFutureNextRunAt(prev, new Date());
+            return {
+              ...prev,
+              lastRunAt: status.lastCronRunAt!,
+              nextRunAt: aligned.nextRunAt,
+            };
+          }
+          return prev;
+        });
       }
-    }, 3000);
-    return () => clearInterval(timer);
+
+      if (status.schedule && status.schedule.lastRunAt) {
+        setSchedule((prev) => {
+          const prevLast = prev.lastRunAt ? new Date(prev.lastRunAt).getTime() : 0;
+          const daemonLast = new Date(status.schedule.lastRunAt).getTime();
+          if (Number.isFinite(daemonLast) && daemonLast > prevLast) {
+            const aligned = ensureFutureNextRunAt(
+              { ...prev, nextRunAt: status.schedule.nextRunAt || prev.nextRunAt },
+              new Date()
+            );
+            return {
+              ...prev,
+              lastRunAt: status.schedule.lastRunAt,
+              nextRunAt: aligned.nextRunAt,
+            };
+          }
+          return prev;
+        });
+      }
+
+      if (Array.isArray(status.recentBackgroundRuns) && status.recentBackgroundRuns.length > 0) {
+        for (const bgRun of status.recentBackgroundRuns) {
+          if (syncedRunIdsRef.current.has(bgRun.id)) continue;
+          syncedRunIdsRef.current.add(bgRun.id);
+
+          setLogs((prevLogs) => {
+            if (prevLogs.some((l) => l.id === bgRun.id)) return prevLogs;
+            return [
+              {
+                id: bgRun.id,
+                timestamp: bgRun.timestamp,
+                action: 'Auto-Backup Background 24/7',
+                targetServer: bgRun.serverName,
+                details: bgRun.details,
+                status: bgRun.status,
+              },
+              ...prevLogs.slice(0, 99),
+            ];
+          });
+
+          setServers((prevServers) =>
+            prevServers.map((srv) => {
+              if (srv.id !== bgRun.serverId && srv.identifier !== bgRun.serverIdentifier) {
+                return srv;
+              }
+              if (srv.backups.some((b) => b.uuid === bgRun.backupUuid)) {
+                return srv;
+              }
+              const bgBackup: PteroBackupFile = {
+                id: bgRun.backupUuid,
+                uuid: bgRun.backupUuid,
+                serverId: srv.id,
+                serverName: srv.name,
+                serverIdentifier: srv.identifier,
+                fileName: bgRun.fileName,
+                sizeBytes: bgRun.sizeBytes || 0,
+                checksum: 'sha256:completed-background',
+                createdAt: bgRun.timestamp,
+                completedAt: bgRun.timestamp,
+                status: 'completed',
+                isLocked: false,
+                triggerType: 'auto_schedule',
+                ignoredFiles: '',
+                driveFileId: bgRun.driveFileId,
+                driveWebViewLink: bgRun.driveWebViewLink,
+                driveUploadedAt: bgRun.driveFileId ? bgRun.timestamp : undefined,
+              };
+              return {
+                ...srv,
+                backups: [bgBackup, ...srv.backups],
+              };
+            })
+          );
+        }
+      }
+
+      // If a scheduled cycle expired while the user had the panel closed and neither daemon nor cron ran it yet, catch up now!
+      if (missedOfflineCycleRef.current && scheduleRef.current.enabled && !isRunningScheduleRef.current) {
+        missedOfflineCycleRef.current = false;
+        const lastRunMs = scheduleRef.current.lastRunAt
+          ? new Date(scheduleRef.current.lastRunAt).getTime()
+          : 0;
+        const daemonLastMs = status.schedule?.lastRunAt
+          ? new Date(status.schedule.lastRunAt).getTime()
+          : 0;
+        const cronLastMs = status.lastCronRunAt ? new Date(status.lastCronRunAt).getTime() : 0;
+        const mostRecentRunMs = Math.max(lastRunMs, daemonLastMs, cronLastMs);
+        const intervalMs = Math.max(
+          60 * 1000,
+          Math.round((Number(scheduleRef.current.intervalHours) || 1) * 3600 * 1000)
+        );
+        if (Date.now() - mostRecentRunMs >= intervalMs) {
+          triggerScheduleRef.current();
+        }
+      }
+    };
+
+    pullDaemonUpdates();
+    const pollInterval = setInterval(pullDaemonUpdates, 15000);
+    return () => {
+      mounted = false;
+      clearInterval(pollInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    const stopWorker = createBackgroundTimerWorker(() => {
+      const cur = scheduleRef.current;
+      const now = new Date();
+      const nextMs = new Date(cur.nextRunAt).getTime();
+
+      if (!Number.isFinite(nextMs) || now.getTime() >= nextMs) {
+        if (cur.enabled && !isRunningScheduleRef.current) {
+          triggerScheduleRef.current();
+        } else {
+          // Even if disabled or currently running, roll nextRunAt into the future so timer never sticks at 00:00:00
+          const aligned = ensureFutureNextRunAt(cur, now);
+          if (aligned.nextRunAt !== cur.nextRunAt) {
+            setSchedule((prev) => ({
+              ...prev,
+              nextRunAt: aligned.nextRunAt,
+            }));
+          }
+        }
+      }
+    }, 2000);
+
+    return () => stopWorker();
   }, []);
 
   /**

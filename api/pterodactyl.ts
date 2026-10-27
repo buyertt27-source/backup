@@ -802,6 +802,56 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
+    // =========================================================================
+    // 7. POST /api/pterodactyl/daemon/sync & /api/pterodactyl/daemon/status
+    // =========================================================================
+    if (routeKey.includes('daemon/sync') || routeKey.includes('daemon/status')) {
+      const { schedule, credentials, driveConfig } = body || {};
+      let updatedSchedule = schedule ? { ...schedule } : undefined;
+
+      if (updatedSchedule) {
+        const nowMs = Date.now();
+        const nextMs = updatedSchedule.nextRunAt ? new Date(updatedSchedule.nextRunAt).getTime() : NaN;
+        if (!Number.isFinite(nextMs) || nextMs <= nowMs) {
+          const hours = Number(updatedSchedule.intervalHours) > 0 ? Number(updatedSchedule.intervalHours) : 1;
+          const intervalMs = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
+          updatedSchedule.nextRunAt = new Date(nowMs + intervalMs).toISOString();
+        }
+      }
+
+      if (routeKey.includes('daemon/sync') && driveConfig?.appsScriptUrl && credentials?.domain) {
+        try {
+          await fetchWithTimeout(
+            driveConfig.appsScriptUrl.trim(),
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: JSON.stringify({
+                action: 'configure_cron',
+                enabled: Boolean(updatedSchedule?.enabled),
+                intervalHours: updatedSchedule?.intervalHours || 1,
+                domain: cleanDomain(credentials.domain),
+                pltsKey: (credentials.pltsKey || '').trim(),
+                targetFolderId: driveConfig.targetFolderId || '',
+                autoDeletePrevious: Boolean(updatedSchedule?.autoDeletePrevious ?? true),
+              }),
+            },
+            10000
+          );
+        } catch {
+          // non-blocking
+        }
+      }
+
+      res.status(200).json({
+        ok: true,
+        schedule: updatedSchedule || null,
+        recentBackgroundRuns: [],
+        isDaemonRunning: false,
+      });
+      return;
+    }
+
     res.status(404).json({ ok: false, error: `Endpoint tidak ditemukan: ${routeKey}` });
   } catch (err: any) {
     res.status(502).json({
@@ -810,3 +860,4 @@ export default async function handler(req: any, res: any) {
     });
   }
 }
+

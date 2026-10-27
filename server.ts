@@ -1,4 +1,5 @@
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -1065,6 +1066,456 @@ export function createApiApp() {
     }
   });
 
+  // ============================================================================
+  // 24/7 AUTONOMOUS BACKGROUND AUTO-BACKUP DAEMON (Runs even when panel is closed)
+  // ============================================================================
+  const DAEMON_STATE_FILE = path.join(__dirname, '.pterovault-daemon-state.json');
+
+  interface DaemonState {
+    schedule: {
+      enabled: boolean;
+      frequency: 'interval_hours' | 'daily' | 'weekly';
+      intervalHours: number;
+      timeOfDay: string;
+      dayOfWeek: number;
+      targetScope: 'all' | 'selected';
+      selectedServerIds: string[];
+      retentionCount: number;
+      autoDeletePrevious: boolean;
+      autoDeleteStrategy: 'delete_all_previous' | 'keep_retention_count';
+      lockNewBackups: boolean;
+      saveToGoogleDrive: boolean;
+      lastRunAt: string | null;
+      nextRunAt: string;
+    };
+    credentials: {
+      domain: string;
+      pltaKey: string;
+      pltsKey: string;
+    };
+    driveConfig: {
+      appsScriptUrl: string;
+      targetFolderId: string;
+      googleAccessToken: string;
+    };
+    recentBackgroundRuns: Array<{
+      id: string;
+      timestamp: string;
+      serverId: string;
+      serverIdentifier: string;
+      serverName: string;
+      backupUuid: string;
+      fileName: string;
+      sizeBytes: number;
+      driveFileId?: string;
+      driveWebViewLink?: string;
+      details: string;
+      status: 'success' | 'error' | 'info';
+    }>;
+  }
+
+  function computeDaemonNextRun(
+    sched: DaemonState['schedule'],
+    baseDate: Date = new Date()
+  ): string {
+    const nowMs = baseDate.getTime();
+    if (sched.frequency !== 'daily' && sched.frequency !== 'weekly') {
+      const hours = Number(sched.intervalHours) > 0 ? Number(sched.intervalHours) : 1;
+      const intervalMs = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
+      const existingNextMs = sched.nextRunAt ? new Date(sched.nextRunAt).getTime() : NaN;
+      if (Number.isFinite(existingNextMs) && existingNextMs <= nowMs) {
+        const missed = Math.floor((nowMs - existingNextMs) / intervalMs) + 1;
+        const aligned = existingNextMs + missed * intervalMs;
+        return new Date(aligned > nowMs ? aligned : nowMs + intervalMs).toISOString();
+      }
+      return new Date(nowMs + intervalMs).toISOString();
+    }
+
+    const next = new Date(nowMs);
+    const [hhStr, mmStr] = (sched.timeOfDay || '03:00').split(':');
+    next.setHours(
+      Math.min(23, Math.max(0, parseInt(hhStr || '3', 10) || 0)),
+      Math.min(59, Math.max(0, parseInt(mmStr || '0', 10) || 0)),
+      0,
+      0
+    );
+    if (sched.frequency === 'daily') {
+      if (next.getTime() <= nowMs) next.setDate(next.getDate() + 1);
+      return next.toISOString();
+    }
+    const targetDay = Math.min(6, Math.max(0, sched.dayOfWeek ?? 1));
+    let daysUntil = (targetDay - next.getDay() + 7) % 7;
+    if (daysUntil === 0 && next.getTime() <= nowMs) daysUntil = 7;
+    next.setDate(next.getDate() + daysUntil);
+    return next.toISOString();
+  }
+
+  let daemonState: DaemonState = {
+    schedule: {
+      enabled: false,
+      frequency: 'interval_hours',
+      intervalHours: 1,
+      timeOfDay: '03:00',
+      dayOfWeek: 1,
+      targetScope: 'all',
+      selectedServerIds: [],
+      retentionCount: 1,
+      autoDeletePrevious: true,
+      autoDeleteStrategy: 'delete_all_previous',
+      lockNewBackups: false,
+      saveToGoogleDrive: true,
+      lastRunAt: null,
+      nextRunAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    },
+    credentials: { domain: '', pltaKey: '', pltsKey: '' },
+    driveConfig: { appsScriptUrl: '', targetFolderId: '', googleAccessToken: '' },
+    recentBackgroundRuns: [],
+  };
+
+  try {
+    if (fs.existsSync(DAEMON_STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DAEMON_STATE_FILE, 'utf-8'));
+      if (raw && typeof raw === 'object') {
+        daemonState = {
+          ...daemonState,
+          ...raw,
+          schedule: { ...daemonState.schedule, ...(raw.schedule || {}) },
+          credentials: { ...daemonState.credentials, ...(raw.credentials || {}) },
+          driveConfig: { ...daemonState.driveConfig, ...(raw.driveConfig || {}) },
+          recentBackgroundRuns: Array.isArray(raw.recentBackgroundRuns)
+            ? raw.recentBackgroundRuns.slice(0, 50)
+            : [],
+        };
+      }
+    }
+  } catch {
+    // ignore corrupt state file
+  }
+
+  function saveDaemonState() {
+    try {
+      fs.writeFileSync(DAEMON_STATE_FILE, JSON.stringify(daemonState, null, 2), 'utf-8');
+    } catch {
+      // ignore write errors in read-only environments
+    }
+  }
+
+  let isDaemonExecuting = false;
+
+  async function executeBackgroundDaemonCycle() {
+    if (isDaemonExecuting) return;
+    const { schedule, credentials, driveConfig } = daemonState;
+    const baseUrl = cleanDomain(credentials.domain);
+    const plts = (credentials.pltsKey || '').trim();
+
+    // Always roll nextRunAt forward into the future FIRST so countdown never sticks at 00:00:00
+    const nextFutureIso = computeDaemonNextRun(schedule, new Date());
+    daemonState.schedule.nextRunAt = nextFutureIso;
+    saveDaemonState();
+
+    if (!baseUrl || !plts) {
+      return;
+    }
+
+    isDaemonExecuting = true;
+    try {
+      const pteroHeaders = {
+        Authorization: `Bearer ${plts}`,
+        Accept: 'Application/vnd.pterodactyl.v1+json',
+        'Content-Type': 'application/json',
+      };
+
+      const clientRes = await fetchWithTimeout(`${baseUrl}/api/client`, {
+        method: 'GET',
+        headers: pteroHeaders,
+      });
+      if (!clientRes.ok) return;
+
+      const clientJson = (await clientRes.json()) as any;
+      const items = Array.isArray(clientJson?.data) ? clientJson.data : [];
+
+      for (let idx = 0; idx < items.length; idx++) {
+        const attr = items[idx]?.attributes || {};
+        const identifier = String(attr.identifier || '');
+        const srvId = String(attr.uuid || identifier);
+        const srvName = String(attr.name || `Server ${idx + 1}`);
+        const backupLimit = Number(attr.feature_limits?.backups ?? 5);
+
+        if (!identifier) continue;
+        if (
+          schedule.targetScope === 'selected' &&
+          schedule.selectedServerIds.length > 0 &&
+          !schedule.selectedServerIds.includes(srvId) &&
+          !schedule.selectedServerIds.includes(identifier)
+        ) {
+          continue;
+        }
+
+        // 1. Auto-delete previous unlocked backups if enabled
+        if (schedule.autoDeletePrevious) {
+          try {
+            const listBkpRes = await fetchWithTimeout(
+              `${baseUrl}/api/client/servers/${identifier}/backups`,
+              { method: 'GET', headers: pteroHeaders }
+            );
+            if (listBkpRes.ok) {
+              const bkpJson = (await listBkpRes.json()) as any;
+              const existingList = Array.isArray(bkpJson?.data) ? bkpJson.data : [];
+              const unlocked = existingList
+                .map((b: any) => b?.attributes || {})
+                .filter((b: any) => b.uuid && !b.is_locked);
+
+              const toDeleteCount =
+                schedule.autoDeleteStrategy === 'delete_all_previous'
+                  ? unlocked.length
+                  : Math.max(
+                      backupLimit > 0 && existingList.length >= backupLimit ? 1 : 0,
+                      existingList.length - Math.max(0, (schedule.retentionCount || 1) - 1)
+                    );
+
+              for (const oldBkp of unlocked.slice(0, Math.max(0, toDeleteCount))) {
+                await fetchWithTimeout(
+                  `${baseUrl}/api/client/servers/${identifier}/backups/${oldBkp.uuid}`,
+                  { method: 'DELETE', headers: pteroHeaders }
+                ).catch(() => {});
+              }
+            }
+          } catch {
+            // continue
+          }
+        }
+
+        // 2. Create real backup on Pterodactyl
+        const nowIso = new Date().toISOString();
+        const fileName = buildIsolatedFileName(idx + 1, identifier, srvName, srvName, nowIso);
+        const createRes = await fetchWithTimeout(
+          `${baseUrl}/api/client/servers/${identifier}/backups`,
+          {
+            method: 'POST',
+            headers: pteroHeaders,
+            body: JSON.stringify({
+              name: fileName,
+              is_locked: Boolean(schedule.lockNewBackups),
+            }),
+          }
+        );
+
+        if (!createRes.ok) continue;
+        const createdJson = (await createRes.json()) as any;
+        const createdAttr = createdJson?.attributes || {};
+        const backupUuid = String(createdAttr.uuid || '');
+        if (!backupUuid) continue;
+
+        // 3. Wait for Wings daemon to finish compressing (.tar.gz)
+        let finalBytes = Number(createdAttr.bytes) || 0;
+        for (let attempt = 0; attempt < 24; attempt++) {
+          await new Promise((r) => setTimeout(r, 2500));
+          try {
+            const stRes = await fetchWithTimeout(
+              `${baseUrl}/api/client/servers/${identifier}/backups/${backupUuid}`,
+              { method: 'GET', headers: pteroHeaders }
+            );
+            if (stRes.ok) {
+              const stJson = (await stRes.json()) as any;
+              const stAttr = stJson?.attributes || {};
+              if (stAttr.completed_at) {
+                finalBytes = Number(stAttr.bytes) || finalBytes;
+                break;
+              }
+            }
+          } catch {
+            // continue polling
+          }
+        }
+
+        // 4. Upload to Google Drive if enabled
+        let driveFileId: string | undefined;
+        let driveWebViewLink: string | undefined;
+
+        if (schedule.saveToGoogleDrive) {
+          let signedUrl = '';
+          try {
+            const dlRes = await fetchWithTimeout(
+              `${baseUrl}/api/client/servers/${identifier}/backups/${backupUuid}/download`,
+              { method: 'GET', headers: pteroHeaders }
+            );
+            if (dlRes.ok) {
+              const dlJson = (await dlRes.json()) as any;
+              signedUrl = dlJson?.attributes?.url || dlJson?.url || '';
+            }
+          } catch {
+            // ignore
+          }
+
+          const safeServerFolder = `Server_${String(idx + 1).padStart(2, '0')}_${identifier}_${srvName
+            .replace(/[^a-zA-Z0-9_-]+/g, '_')
+            .slice(0, 24)}`;
+
+          if (driveConfig.appsScriptUrl) {
+            try {
+              const bridgeRes = await fetchWithTimeout(
+                driveConfig.appsScriptUrl.trim(),
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                  body: JSON.stringify({
+                    action: 'upload_backup',
+                    targetFolderId: driveConfig.targetFolderId || '',
+                    rootFolderName: 'PteroVault_Backups',
+                    serverFolderName: safeServerFolder,
+                    fileName,
+                    mimeType: 'application/gzip',
+                    signedWingsUrl: signedUrl || null,
+                    domain: baseUrl,
+                    pltsKey: plts,
+                    serverIdentifier: identifier,
+                    backupUuid,
+                  }),
+                },
+                55000
+              );
+              const bridgeJson = (await bridgeRes.json().catch(() => null)) as any;
+              if (bridgeJson?.ok) {
+                driveFileId = bridgeJson.fileId;
+                driveWebViewLink = bridgeJson.webViewLink;
+                if (Number(bridgeJson.sizeBytes) > 0) {
+                  finalBytes = Number(bridgeJson.sizeBytes);
+                }
+              }
+            } catch {
+              // ignore bridge error
+            }
+          }
+        }
+
+        const completedIso = new Date().toISOString();
+        daemonState.schedule.lastRunAt = completedIso;
+        daemonState.recentBackgroundRuns = [
+          {
+            id: `bg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: completedIso,
+            serverId: srvId,
+            serverIdentifier: identifier,
+            serverName: srvName,
+            backupUuid,
+            fileName,
+            sizeBytes: finalBytes,
+            driveFileId,
+            driveWebViewLink,
+            details: `Auto-Backup Background Daemon berhasil membuat ${fileName}${
+              driveFileId ? ' & mengunggah ke Google Drive' : ' di Panel Pterodactyl'
+            } (berjalan otomatis tanpa membuka panel).`,
+            status: 'success' as const,
+          },
+          ...daemonState.recentBackgroundRuns.slice(0, 49),
+        ];
+        saveDaemonState();
+      }
+    } finally {
+      isDaemonExecuting = false;
+    }
+  }
+
+  // Background heartbeat every 5 seconds on the server
+  setInterval(() => {
+    if (!daemonState.schedule.enabled || isDaemonExecuting) return;
+    const nowMs = Date.now();
+    const nextMs = new Date(daemonState.schedule.nextRunAt).getTime();
+    if (!Number.isFinite(nextMs) || nowMs >= nextMs) {
+      executeBackgroundDaemonCycle().catch(() => {});
+    }
+  }, 5000);
+
+  /**
+   * POST /api/pterodactyl/daemon/sync
+   * Syncs schedule, credentials, and Google Drive bridge settings to the 24/7 server-side daemon
+   * and configures the 24/7 Google Apps Script Cloud Cron trigger if Apps Script Bridge is used.
+   */
+  app.post('/api/pterodactyl/daemon/sync', async (req, res) => {
+    const { schedule, credentials, driveConfig } = req.body || {};
+
+    if (schedule && typeof schedule === 'object') {
+      daemonState.schedule = {
+        ...daemonState.schedule,
+        ...schedule,
+      };
+      // Ensure nextRunAt is strictly in the future so the UI never sticks at 00:00:00
+      const nextMs = new Date(daemonState.schedule.nextRunAt).getTime();
+      if (!Number.isFinite(nextMs) || nextMs <= Date.now()) {
+        daemonState.schedule.nextRunAt = computeDaemonNextRun(daemonState.schedule, new Date());
+      }
+    }
+
+    if (credentials && typeof credentials === 'object') {
+      daemonState.credentials = {
+        domain: credentials.domain ?? daemonState.credentials.domain,
+        pltaKey: credentials.pltaKey ?? daemonState.credentials.pltaKey,
+        pltsKey: credentials.pltsKey ?? daemonState.credentials.pltsKey,
+      };
+    }
+
+    if (driveConfig && typeof driveConfig === 'object') {
+      daemonState.driveConfig = {
+        appsScriptUrl: driveConfig.appsScriptUrl ?? daemonState.driveConfig.appsScriptUrl,
+        targetFolderId: driveConfig.targetFolderId ?? daemonState.driveConfig.targetFolderId,
+        googleAccessToken:
+          driveConfig.googleAccessToken ?? daemonState.driveConfig.googleAccessToken,
+      };
+    }
+
+    saveDaemonState();
+
+    // Also configure 24/7 Google Apps Script Cloud Cron Trigger in the background if Apps Script URL is set
+    if (daemonState.driveConfig.appsScriptUrl && daemonState.credentials.domain) {
+      fetchWithTimeout(
+        daemonState.driveConfig.appsScriptUrl.trim(),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'configure_cron',
+            enabled: Boolean(daemonState.schedule.enabled),
+            intervalHours: daemonState.schedule.intervalHours || 1,
+            domain: cleanDomain(daemonState.credentials.domain),
+            pltsKey: (daemonState.credentials.pltsKey || '').trim(),
+            targetFolderId: daemonState.driveConfig.targetFolderId || '',
+            autoDeletePrevious: Boolean(daemonState.schedule.autoDeletePrevious ?? true),
+          }),
+        },
+        10000
+      ).catch(() => {});
+    }
+
+    res.json({
+      ok: true,
+      schedule: daemonState.schedule,
+      recentBackgroundRuns: daemonState.recentBackgroundRuns,
+      isDaemonRunning: isDaemonExecuting,
+    });
+  });
+
+  /**
+   * POST & GET /api/pterodactyl/daemon/status
+   * Returns current 24/7 background daemon state, rolling nextRunAt forward if needed.
+   */
+  const handleDaemonStatus = (_req: express.Request, res: express.Response) => {
+    if (daemonState.schedule.enabled) {
+      const nextMs = new Date(daemonState.schedule.nextRunAt).getTime();
+      if (!Number.isFinite(nextMs) || Date.now() >= nextMs) {
+        executeBackgroundDaemonCycle().catch(() => {});
+      }
+    }
+    res.json({
+      ok: true,
+      schedule: daemonState.schedule,
+      recentBackgroundRuns: daemonState.recentBackgroundRuns,
+      isDaemonRunning: isDaemonExecuting,
+    });
+  };
+
+  app.post('/api/pterodactyl/daemon/status', handleDaemonStatus);
+  app.get('/api/pterodactyl/daemon/status', handleDaemonStatus);
+
   return app;
 }
 
@@ -1095,3 +1546,4 @@ async function startServer() {
 if (!process.env.VERCEL) {
   startServer();
 }
+

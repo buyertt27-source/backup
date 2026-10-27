@@ -893,3 +893,195 @@ export async function waitForPteroBackupCompletion(params: {
 
   return backup;
 }
+
+function getConfiguredTargetFolderId(): string {
+  try {
+    const rawMain = localStorage.getItem('pterovault_gdrive_vercel_config_v1');
+    if (rawMain) {
+      const parsedMain = JSON.parse(rawMain);
+      if (typeof parsedMain?.targetFolderId === 'string' && parsedMain.targetFolderId.trim()) {
+        return parsedMain.targetFolderId.trim();
+      }
+    }
+    const rawLegacy = localStorage.getItem('pterovault_drive_bridge_v1');
+    if (rawLegacy) {
+      const parsedLegacy = JSON.parse(rawLegacy);
+      if (typeof parsedLegacy?.folderId === 'string' && parsedLegacy.folderId.trim()) {
+        return parsedLegacy.folderId.trim();
+      }
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Syncs the active Auto-Backup schedule, Pterodactyl credentials, and Google Drive Bridge configuration
+ * to both the 24/7 Server Daemon (`/api/pterodactyl/daemon/sync`) and the 24/7 Google Apps Script Cloud Cron
+ * so scheduled backups run automatically even when the user closes the web panel.
+ */
+export async function syncAutoBackupDaemon(params: {
+  schedule: any;
+  credentials: { domain: string; pltaKey: string; pltsKey: string };
+  googleAccessToken?: string | null;
+}): Promise<any> {
+  const appsScriptUrl = getConfiguredAppsScriptUrl();
+  const targetFolderId = getConfiguredTargetFolderId();
+
+  // 1. Configure 24/7 Google Apps Script Cloud Cron directly if bridge URL is set
+  if (appsScriptUrl && params.credentials.domain) {
+    fetch(appsScriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'configure_cron',
+        enabled: Boolean(params.schedule?.enabled),
+        intervalHours: Number(params.schedule?.intervalHours) || 1,
+        domain: cleanDomainUrl(params.credentials.domain),
+        pltsKey: (params.credentials.pltsKey || '').trim(),
+        targetFolderId,
+        autoDeletePrevious: Boolean(params.schedule?.autoDeletePrevious ?? true),
+      }),
+    }).catch(() => {});
+  }
+
+  // 2. Sync with backend 24/7 server daemon
+  for (const endpoint of ['/api/pterodactyl/daemon/sync', '/api/pterodactyl?action=daemon/sync']) {
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schedule: params.schedule,
+          credentials: params.credentials,
+          driveConfig: {
+            appsScriptUrl,
+            targetFolderId,
+            googleAccessToken: params.googleAccessToken || '',
+          },
+        }),
+      });
+      const text = await res.text();
+      const parsed = text ? JSON.parse(text) : null;
+      if (parsed && parsed.ok) {
+        return parsed;
+      }
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
+/**
+ * Polls the 24/7 background daemon (and Google Apps Script Cloud Cron status) to retrieve any backups
+ * that were executed while the user's browser tab was closed or inactive.
+ */
+export async function fetchAutoBackupDaemonStatus(): Promise<{
+  schedule?: any;
+  recentBackgroundRuns?: Array<{
+    id: string;
+    timestamp: string;
+    serverId: string;
+    serverIdentifier: string;
+    serverName: string;
+    backupUuid: string;
+    fileName: string;
+    sizeBytes: number;
+    driveFileId?: string;
+    driveWebViewLink?: string;
+    details: string;
+    status: 'success' | 'error' | 'info';
+  }>;
+  lastCronRunAt?: string | null;
+} | null> {
+  const result: {
+    schedule?: any;
+    recentBackgroundRuns?: any[];
+    lastCronRunAt?: string | null;
+  } = {};
+
+  for (const endpoint of ['/api/pterodactyl/daemon/status', '/api/pterodactyl?action=daemon/status']) {
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const text = await res.text();
+      const parsed = text ? JSON.parse(text) : null;
+      if (parsed && parsed.ok) {
+        result.schedule = parsed.schedule;
+        result.recentBackgroundRuns = parsed.recentBackgroundRuns;
+        break;
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  const appsScriptUrl = getConfiguredAppsScriptUrl();
+  if (appsScriptUrl) {
+    try {
+      const bridgeRes = await fetch(appsScriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action: 'cron_status' }),
+      });
+      const bridgeJson = await bridgeRes.json().catch(() => null);
+      if (bridgeJson?.ok && bridgeJson.lastCronRunAt) {
+        result.lastCronRunAt = bridgeJson.lastCronRunAt;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Creates a dedicated Web Worker heartbeat timer that is NOT throttled or frozen
+ * when the browser tab is in the background or minimized.
+ */
+export function createBackgroundTimerWorker(onTick: () => void, intervalMs = 2000): () => void {
+  let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  let worker: Worker | null = null;
+  let blobUrl: string | null = null;
+
+  try {
+    const workerCode = `
+      setInterval(function() {
+        postMessage('tick');
+      }, ${intervalMs});
+    `;
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    blobUrl = URL.createObjectURL(blob);
+    worker = new Worker(blobUrl);
+    worker.onmessage = () => {
+      onTick();
+    };
+  } catch {
+    // Fallback if Worker is blocked by CSP
+  }
+
+  // Always keep a standard interval + visibilitychange listener alongside the Worker
+  fallbackTimer = setInterval(onTick, intervalMs);
+  const handleVisibility = () => {
+    if (document.visibilityState === 'visible') {
+      onTick();
+    }
+  };
+  document.addEventListener('visibilitychange', handleVisibility);
+  window.addEventListener('focus', onTick);
+
+  return () => {
+    if (fallbackTimer) clearInterval(fallbackTimer);
+    if (worker) worker.terminate();
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    document.removeEventListener('visibilitychange', handleVisibility);
+    window.removeEventListener('focus', onTick);
+  };
+}
+

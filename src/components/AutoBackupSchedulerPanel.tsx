@@ -6,7 +6,11 @@ import {
   ScheduleFrequency,
   ThemeMode,
 } from '../types/pterodactyl';
-import { calculateNextScheduleRun, formatCountdownMs } from '../utils/backupLogic';
+import {
+  calculateNextScheduleRun,
+  ensureFutureNextRunAt,
+  formatCountdownMs,
+} from '../utils/backupLogic';
 import {
   Clock,
   CalendarCheck,
@@ -100,12 +104,19 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     setSaveToGoogleDrive(schedule.saveToGoogleDrive ?? true);
   }, [schedule]);
 
-  // Live 1-second tick for real-time countdown display
+  // Live 1-second tick + visibility wake-up for real-time countdown display
   useEffect(() => {
     const ticker = setInterval(() => {
       setNowMs(Date.now());
     }, 1000);
-    return () => clearInterval(ticker);
+    const handleWake = () => setNowMs(Date.now());
+    document.addEventListener('visibilitychange', handleWake);
+    window.addEventListener('focus', handleWake);
+    return () => {
+      clearInterval(ticker);
+      document.removeEventListener('visibilitychange', handleWake);
+      window.removeEventListener('focus', handleWake);
+    };
   }, []);
 
   const isDark = theme === 'dark';
@@ -201,11 +212,11 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
       setSaveFeedback(
         `Pengaturan Auto-Backup disimpan & diaktifkan! Menjalankan backup pertama sekarang ke ${
           nextSchedule.saveToGoogleDrive ? 'Panel + Google Drive' : 'Panel Pterodactyl'
-        }, lalu berlanjut otomatis sesuai jadwal.`
+        }, lalu berlanjut otomatis 24/7 di background.`
       );
     } else {
       setSaveFeedback(
-        `Jadwal Auto-Update berhasil disimpan & diaktifkan (${
+        `Jadwal Auto-Update 24/7 berhasil disimpan & diaktifkan (${
           autoDeletePrevious
             ? autoDeleteStrategy === 'delete_all_previous'
               ? 'Otomatis hapus semua backup sebelumnya di Pterodactyl'
@@ -219,8 +230,23 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     setTimeout(() => setSaveFeedback(null), 6000);
   };
 
-  const remainingMs = Math.max(0, new Date(schedule.nextRunAt).getTime() - nowMs);
+  // Ensure countdown never gets stuck at 00:00:00 even if schedule.nextRunAt just passed
+  const alignedSchedule = ensureFutureNextRunAt(schedule, new Date(nowMs));
+  const rawRemainingMs = new Date(schedule.nextRunAt).getTime() - nowMs;
+  const remainingMs =
+    rawRemainingMs > 0
+      ? rawRemainingMs
+      : Math.max(1000, new Date(alignedSchedule.nextRunAt).getTime() - nowMs);
   const countdownText = formatCountdownMs(remainingMs);
+
+  // If schedule.nextRunAt is reached while viewing this panel, roll it forward & trigger run
+  useEffect(() => {
+    if (!schedule.enabled || isRunningAutoBackup) return;
+    const scheduledMs = new Date(schedule.nextRunAt).getTime();
+    if (!Number.isFinite(scheduledMs) || nowMs >= scheduledMs) {
+      onTriggerScheduledRunNow();
+    }
+  }, [nowMs, schedule.enabled, schedule.nextRunAt, isRunningAutoBackup, onTriggerScheduledRunNow]);
 
   return (
     <section

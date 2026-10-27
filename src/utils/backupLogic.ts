@@ -207,7 +207,7 @@ export function calculateNextScheduleRun(
 ): string {
   const next = new Date(baseDate.getTime());
 
-  if (schedule.frequency === 'interval_hours') {
+  if (schedule.frequency !== 'daily' && schedule.frequency !== 'weekly') {
     const hours = Number(schedule.intervalHours) > 0 ? Number(schedule.intervalHours) : 1;
     const msToAdd = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
     return new Date(baseDate.getTime() + msToAdd).toISOString();
@@ -234,6 +234,59 @@ export function calculateNextScheduleRun(
   }
   next.setDate(next.getDate() + daysUntil);
   return next.toISOString();
+}
+
+/**
+ * Ensures nextRunAt is strictly in the future relative to `nowDate` so the countdown timer
+ * never gets stuck at 00:00:00 when the user returns to the panel or when a cycle finishes.
+ * Also reports whether any scheduled cycle was due (`wasDue: true`).
+ */
+export function ensureFutureNextRunAt(
+  schedule: Pick<
+    AutoBackupSchedule,
+    'frequency' | 'intervalHours' | 'timeOfDay' | 'dayOfWeek' | 'nextRunAt'
+  >,
+  nowDate: Date = new Date()
+): { nextRunAt: string; wasDue: boolean; missedCycles: number } {
+  const nowMs = nowDate.getTime();
+  const currentNextMs = schedule.nextRunAt ? new Date(schedule.nextRunAt).getTime() : NaN;
+
+  if (Number.isFinite(currentNextMs) && currentNextMs > nowMs) {
+    return {
+      nextRunAt: new Date(currentNextMs).toISOString(),
+      wasDue: false,
+      missedCycles: 0,
+    };
+  }
+
+  if (schedule.frequency !== 'daily' && schedule.frequency !== 'weekly') {
+    const hours = Number(schedule.intervalHours) > 0 ? Number(schedule.intervalHours) : 1;
+    const intervalMs = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
+
+    if (Number.isFinite(currentNextMs) && currentNextMs <= nowMs) {
+      const elapsedMs = nowMs - currentNextMs;
+      const missedCycles = Math.floor(elapsedMs / intervalMs) + 1;
+      const alignedNextMs = currentNextMs + missedCycles * intervalMs;
+      const safeNextMs = alignedNextMs > nowMs ? alignedNextMs : nowMs + intervalMs;
+      return {
+        nextRunAt: new Date(safeNextMs).toISOString(),
+        wasDue: true,
+        missedCycles,
+      };
+    }
+
+    return {
+      nextRunAt: new Date(nowMs + intervalMs).toISOString(),
+      wasDue: true,
+      missedCycles: 1,
+    };
+  }
+
+  return {
+    nextRunAt: calculateNextScheduleRun(schedule, nowDate),
+    wasDue: true,
+    missedCycles: 1,
+  };
 }
 
 /**
@@ -378,8 +431,9 @@ export function validateAppsScriptUrl(rawUrl: string): { valid: boolean; cleanUr
 }
 
 /**
- * Generates the ready-to-paste Google Apps Script code (doPost + 24/7 Cron) that acts as a permanent,
- * zero-OAuth Google Drive bridge for PteroVault Backups (works on Vercel 24/7 without token expiry).
+ * Generates the ready-to-paste Google Apps Script code (doPost + 24/7 Cloud Cron Trigger)
+ * that acts as a permanent, zero-OAuth Google Drive bridge & autonomous 24/7 backup scheduler
+ * even when the user closes their browser or turns off their device.
  */
 export function buildGoogleAppsScriptCode(
   defaultFolderId = '',
@@ -389,7 +443,7 @@ export function buildGoogleAppsScriptCode(
   const cleanDomain = normalizePanelDomain(pteroConfig?.domain || '');
   const cleanPlts = (pteroConfig?.pltsKey || '').trim();
 
-  return `// PteroVault -> Google Drive Bridge & Auto-Backup 24/7 (100% Tanpa OAuth & Anti-Expired)
+  return `// PteroVault -> Google Drive Bridge & Cloud Auto-Backup 24/7 (Jalan Otomatis Walau Browser Ditutup!)
 // Tempel kode ini di https://script.google.com -> Klik Deploy -> New deployment -> Web app -> Anyone -> Copy URL
 
 var DEFAULT_FOLDER_ID = "${cleanFolderId}";
@@ -448,18 +502,131 @@ function pollAndFetchWingsDownloadUrl(domain, pltsKey, serverIdentifier, backupU
   return null;
 }
 
+// Fungsi Otomatis 24/7 yang dijalankan oleh Server Google Cloud meskipun Anda tidak membuka Web Panel
+function runPteroVaultAutoBackupCron() {
+  var props = PropertiesService.getScriptProperties();
+  var domain = props.getProperty("PTERO_DOMAIN") || DEFAULT_PTERO_DOMAIN;
+  var pltsKey = props.getProperty("PTERO_PLTS_KEY") || DEFAULT_PTERO_PLTS_KEY;
+  var folderId = props.getProperty("TARGET_FOLDER_ID") || DEFAULT_FOLDER_ID;
+  var autoDelete = props.getProperty("AUTO_DELETE_PREVIOUS") !== "false";
+
+  if (!domain || !pltsKey) return;
+  var baseUrl = String(domain).replace(/\\/+$/, "");
+  var headers = {
+    "Authorization": "Bearer " + pltsKey,
+    "Accept": "Application/vnd.pterodactyl.v1+json",
+    "Content-Type": "application/json"
+  };
+
+  try {
+    var listRes = UrlFetchApp.fetch(baseUrl + "/api/client", { method: "get", headers: headers, muteHttpExceptions: true });
+    if (listRes.getResponseCode() < 200 || listRes.getResponseCode() >= 300) return;
+    var listJson = JSON.parse(listRes.getContentText());
+    var servers = (listJson && listJson.data) || [];
+    var rootFolder = getTargetRootFolder(folderId, "PteroVault_Backups");
+
+    for (var sIdx = 0; sIdx < servers.length; sIdx++) {
+      var srv = servers[sIdx].attributes || {};
+      var identifier = srv.identifier;
+      var srvName = srv.name || ("Server_" + (sIdx + 1));
+      if (!identifier) continue;
+
+      if (autoDelete) {
+        try {
+          var bkpListRes = UrlFetchApp.fetch(baseUrl + "/api/client/servers/" + identifier + "/backups", { method: "get", headers: headers, muteHttpExceptions: true });
+          if (bkpListRes.getResponseCode() >= 200 && bkpListRes.getResponseCode() < 300) {
+            var bkpData = (JSON.parse(bkpListRes.getContentText()).data) || [];
+            for (var b = 0; b < bkpData.length; b++) {
+              var bAttr = bkpData[b].attributes || {};
+              if (!bAttr.is_locked && bAttr.uuid) {
+                UrlFetchApp.fetch(baseUrl + "/api/client/servers/" + identifier + "/backups/" + bAttr.uuid, { method: "delete", headers: headers, muteHttpExceptions: true });
+              }
+            }
+          }
+        } catch (delErr) {}
+      }
+
+      var nowIso = new Date().toISOString();
+      var safeSlug = String(srvName).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 24);
+      var bkpFileName = "backup_srv0" + (sIdx + 1) + "_" + identifier + "_" + safeSlug + "_" + nowIso.slice(0, 19).replace(/[:T]/g, "-") + ".tar.gz";
+
+      var createRes = UrlFetchApp.fetch(baseUrl + "/api/client/servers/" + identifier + "/backups", {
+        method: "post",
+        headers: headers,
+        payload: JSON.stringify({ name: bkpFileName, is_locked: false }),
+        muteHttpExceptions: true
+      });
+
+      if (createRes.getResponseCode() >= 200 && createRes.getResponseCode() < 300) {
+        var createdAttr = (JSON.parse(createRes.getContentText()).attributes) || {};
+        var bkpUuid = createdAttr.uuid;
+        var wingsUrl = pollAndFetchWingsDownloadUrl(baseUrl, pltsKey, identifier, bkpUuid);
+        if (wingsUrl) {
+          var dlFetch = UrlFetchApp.fetch(wingsUrl, { muteHttpExceptions: true });
+          if (dlFetch.getResponseCode() >= 200 && dlFetch.getResponseCode() < 300) {
+            var subName = "Server_0" + (sIdx + 1) + "_" + identifier + "_" + safeSlug;
+            var subs = rootFolder.getFoldersByName(subName);
+            var subFolder = subs.hasNext() ? subs.next() : rootFolder.createFolder(subName);
+            subFolder.createFile(dlFetch.getBlob().setName(bkpFileName));
+          }
+        }
+      }
+    }
+    props.setProperty("LAST_CRON_RUN_AT", new Date().toISOString());
+  } catch (err) {
+    props.setProperty("LAST_CRON_ERROR", err.toString());
+  }
+}
+
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
     var folderIdToUse = data.targetFolderId || DEFAULT_FOLDER_ID;
     var rootFolder = getTargetRootFolder(folderIdToUse, data.rootFolderName);
 
-    if (data.action === "ping") {
+    if (data.action === "ping" || data.action === "cron_status") {
+      var props = PropertiesService.getScriptProperties();
       return ContentService.createTextOutput(JSON.stringify({
         ok: true,
         email: Session.getEffectiveUser().getEmail() || "Google Drive Terhubung",
         folderName: rootFolder.getName(),
-        folderUrl: rootFolder.getUrl()
+        folderUrl: rootFolder.getUrl(),
+        lastCronRunAt: props.getProperty("LAST_CRON_RUN_AT") || null
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (data.action === "configure_cron") {
+      var cProps = PropertiesService.getScriptProperties();
+      if (data.domain) cProps.setProperty("PTERO_DOMAIN", String(data.domain));
+      if (data.pltsKey) cProps.setProperty("PTERO_PLTS_KEY", String(data.pltsKey));
+      if (data.targetFolderId) cProps.setProperty("TARGET_FOLDER_ID", String(data.targetFolderId));
+      cProps.setProperty("AUTO_DELETE_PREVIOUS", String(data.autoDeletePrevious !== false));
+
+      var triggers = ScriptApp.getProjectTriggers();
+      for (var t = 0; t < triggers.length; t++) {
+        if (triggers[t].getHandlerFunction() === "runPteroVaultAutoBackupCron") {
+          ScriptApp.deleteTrigger(triggers[t]);
+        }
+      }
+
+      var triggerCreated = false;
+      if (data.enabled) {
+        var hoursVal = Number(data.intervalHours) || 1;
+        var tb = ScriptApp.newTrigger("runPteroVaultAutoBackupCron").timeBased();
+        if (hoursVal < 1) {
+          var mins = hoursVal <= 0.1 ? 5 : (hoursVal <= 0.3 ? 15 : 30);
+          tb.everyMinutes(mins).create();
+        } else {
+          var hrs = hoursVal >= 24 ? 24 : (hoursVal >= 12 ? 12 : (hoursVal >= 6 ? 6 : (hoursVal >= 3 ? 4 : 1)));
+          tb.everyHours(hrs).create();
+        }
+        triggerCreated = true;
+      }
+
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        cloudCronActive: triggerCreated,
+        lastCronRunAt: cProps.getProperty("LAST_CRON_RUN_AT") || null
       })).setMimeType(ContentService.MimeType.JSON);
     }
 
