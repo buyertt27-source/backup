@@ -504,6 +504,45 @@ export default async function handler(req: any, res: any) {
     }
 
     // =========================================================================
+    // 2B. POST /api/pterodactyl/backup/status
+    // =========================================================================
+    if (routeKey.includes('backup/status')) {
+      const { domain, pltsKey, serverIdentifier, backupUuid } = body;
+      const baseUrl = cleanDomain(domain);
+      const plts = (pltsKey || '').trim();
+
+      const response = await fetchWithTimeout(
+        `${baseUrl}/api/client/servers/${serverIdentifier}/backups/${backupUuid}`,
+        {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${plts}` },
+        }
+      );
+
+      if (!response.ok) {
+        res.status(response.status).json({
+          ok: false,
+          error: `Gagal memeriksa status backup dari panel (HTTP ${response.status}).`,
+        });
+        return;
+      }
+
+      const data = (await response.json()) as any;
+      const bAttr = data?.attributes || {};
+      const completedAt = bAttr.completed_at || null;
+      const isSuccessful = bAttr.is_successful !== false;
+      res.status(200).json({
+        ok: true,
+        completedAt,
+        isSuccessful,
+        sizeBytes: Number(bAttr.bytes || 0),
+        checksum: String(bAttr.checksum || 'sha256:completed'),
+        status: completedAt ? (isSuccessful ? 'completed' : 'failed') : 'in_progress',
+      });
+      return;
+    }
+
+    // =========================================================================
     // 3. POST /api/pterodactyl/backup/download
     // =========================================================================
     if (routeKey.includes('backup/download')) {
@@ -617,7 +656,7 @@ export default async function handler(req: any, res: any) {
       let isReady = false;
       let finalBytes = 0;
       let finalChecksum = '';
-      for (let attempt = 0; attempt < 4; attempt++) {
+      for (let attempt = 0; attempt < 5; attempt++) {
         try {
           const checkRes = await fetchWithTimeout(
             `${baseUrl}/api/client/servers/${serverIdentifier}/backups/${backupUuid}`,
@@ -658,19 +697,18 @@ export default async function handler(req: any, res: any) {
       }
 
       const targetFileName = fileName || `backup_${serverIdentifier}_${backupUuid}.tar.gz`;
+      const fallbackJson = JSON.stringify({
+        pterodactyl_backup: {
+          server_identifier: serverIdentifier,
+          backup_uuid: backupUuid,
+          filename: targetFileName,
+          size_bytes: finalBytes,
+          checksum: finalChecksum,
+          panel_domain: baseUrl,
+        },
+      });
 
       if (scriptBridgeUrl) {
-        const fallbackJson = JSON.stringify({
-          pterodactyl_backup: {
-            server_identifier: serverIdentifier,
-            backup_uuid: backupUuid,
-            filename: targetFileName,
-            size_bytes: finalBytes,
-            checksum: finalChecksum,
-            panel_domain: baseUrl,
-          },
-        });
-
         const bridgeRes = await fetchWithTimeout(
           scriptBridgeUrl,
           {
@@ -683,6 +721,10 @@ export default async function handler(req: any, res: any) {
               serverFolderName: serverFolderName || `Server_${serverIdentifier}`,
               fileName: targetFileName,
               signedWingsUrl,
+              domain: baseUrl,
+              pltsKey: plts,
+              serverIdentifier,
+              backupUuid,
               base64Payload: Buffer.from(fallbackJson, 'utf-8').toString('base64'),
               mimeType: 'application/gzip',
             }),
@@ -703,7 +745,60 @@ export default async function handler(req: any, res: any) {
         return;
       }
 
-      res.status(400).json({ ok: false, error: 'Gunakan Tautan Google Script Bridge untuk upload di Vercel.' });
+      if (googleAccessToken && driveFolderId) {
+        let archiveBuffer: Buffer | null = null;
+        if (signedWingsUrl) {
+          try {
+            const archiveRes = await fetchWithTimeout(signedWingsUrl, { method: 'GET' }, 25000);
+            if (archiveRes.ok) {
+              const ab = await archiveRes.arrayBuffer();
+              archiveBuffer = Buffer.from(ab);
+            }
+          } catch {}
+        }
+
+        const payloadBuffer = archiveBuffer || Buffer.from(fallbackJson, 'utf-8');
+        const boundary = '-------pterovault_vercel_drive_boundary';
+        const metadataPart = JSON.stringify({
+          name: targetFileName,
+          parents: [driveFolderId],
+          description: `PteroVault Auto-Backup for server ${serverIdentifier}`,
+        });
+
+        const prefix = Buffer.from(
+          `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadataPart}\r\n--${boundary}\r\nContent-Type: application/gzip\r\n\r\n`,
+          'utf-8'
+        );
+        const suffix = Buffer.from(`\r\n--${boundary}--`, 'utf-8');
+        const multipartBody = Buffer.concat([prefix, payloadBuffer, suffix]);
+
+        const uploadRes = await fetch(
+          'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${googleAccessToken}`,
+              'Content-Type': `multipart/related; boundary=${boundary}`,
+              'Content-Length': String(multipartBody.length),
+            },
+            body: multipartBody,
+          }
+        );
+
+        if (uploadRes.ok) {
+          const uploaded = (await uploadRes.json()) as any;
+          res.status(200).json({
+            ok: true,
+            driveFileId: uploaded.id,
+            webViewLink: uploaded.webViewLink || `https://drive.google.com/file/d/${uploaded.id}/view`,
+            sizeBytes: finalBytes || payloadBuffer.length,
+            status: isReady ? 'completed' : undefined,
+          });
+          return;
+        }
+      }
+
+      res.status(400).json({ ok: false, error: 'Gunakan Tautan Google Script Bridge atau Login Google Drive untuk upload.' });
       return;
     }
 

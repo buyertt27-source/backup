@@ -6,16 +6,29 @@ import {
   ScheduleFrequency,
   ThemeMode,
 } from '../types/pterodactyl';
-import { calculateNextScheduleRun } from '../utils/backupLogic';
-import { Clock, CalendarCheck, Play, Save, CheckSquare, Square, CloudUpload, Trash2 } from 'lucide-react';
+import { calculateNextScheduleRun, formatCountdownMs } from '../utils/backupLogic';
+import {
+  Clock,
+  CalendarCheck,
+  Play,
+  Save,
+  CheckSquare,
+  Square,
+  CloudUpload,
+  Trash2,
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw,
+} from 'lucide-react';
 
 interface AutoBackupSchedulerPanelProps {
   schedule: AutoBackupSchedule;
   servers: PteroServer[];
   isDriveConnected: boolean;
+  isRunningAutoBackup?: boolean;
   onRequestGoogleSignIn: () => void;
   onUpdateSchedule: (updated: AutoBackupSchedule) => void;
-  onTriggerScheduledRunNow: () => void;
+  onTriggerScheduledRunNow: (overrideSchedule?: AutoBackupSchedule) => void;
   theme: ThemeMode;
 }
 
@@ -29,10 +42,22 @@ const DAYS_OF_WEEK = [
   { value: 6, label: 'Sabtu' },
 ];
 
+const INTERVAL_OPTIONS = [
+  { value: 0.0833, label: 'Setiap 5 Menit (Tes Cepat ke Drive)' },
+  { value: 0.25, label: 'Setiap 15 Menit' },
+  { value: 0.5, label: 'Setiap 30 Menit' },
+  { value: 1, label: 'Setiap 1 Jam (Per Jam)' },
+  { value: 3, label: 'Setiap 3 Jam' },
+  { value: 6, label: 'Setiap 6 Jam' },
+  { value: 12, label: 'Setiap 12 Jam' },
+  { value: 24, label: 'Setiap 24 Jam' },
+];
+
 export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> = ({
   schedule,
   servers,
   isDriveConnected,
+  isRunningAutoBackup = false,
   onRequestGoogleSignIn,
   onUpdateSchedule,
   onTriggerScheduledRunNow,
@@ -40,7 +65,7 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
 }) => {
   const [enabled, setEnabled] = useState<boolean>(schedule.enabled);
   const [frequency, setFrequency] = useState<ScheduleFrequency>(schedule.frequency);
-  const [intervalHours, setIntervalHours] = useState<number>(schedule.intervalHours);
+  const [intervalHours, setIntervalHours] = useState<number>(schedule.intervalHours || 1);
   const [timeOfDay, setTimeOfDay] = useState<string>(schedule.timeOfDay);
   const [dayOfWeek, setDayOfWeek] = useState<number>(schedule.dayOfWeek);
   const [targetScope, setTargetScope] = useState<'all' | 'selected'>(schedule.targetScope);
@@ -53,13 +78,17 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     schedule.autoDeleteStrategy || 'delete_all_previous'
   );
   const [lockNewBackups, setLockNewBackups] = useState<boolean>(schedule.lockNewBackups);
-  const [saveToGoogleDrive, setSaveToGoogleDrive] = useState<boolean>(Boolean(schedule.saveToGoogleDrive));
+  const [saveToGoogleDrive, setSaveToGoogleDrive] = useState<boolean>(
+    schedule.saveToGoogleDrive ?? true
+  );
+  const [runImmediatelyOnSave, setRunImmediatelyOnSave] = useState<boolean>(true);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   useEffect(() => {
     setEnabled(schedule.enabled);
     setFrequency(schedule.frequency);
-    setIntervalHours(schedule.intervalHours);
+    setIntervalHours(schedule.intervalHours || 1);
     setTimeOfDay(schedule.timeOfDay);
     setDayOfWeek(schedule.dayOfWeek);
     setTargetScope(schedule.targetScope);
@@ -68,10 +97,62 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     setAutoDeletePrevious(schedule.autoDeletePrevious ?? true);
     setAutoDeleteStrategy(schedule.autoDeleteStrategy || 'delete_all_previous');
     setLockNewBackups(schedule.lockNewBackups);
-    setSaveToGoogleDrive(Boolean(schedule.saveToGoogleDrive));
+    setSaveToGoogleDrive(schedule.saveToGoogleDrive ?? true);
   }, [schedule]);
 
+  // Live 1-second tick for real-time countdown display
+  useEffect(() => {
+    const ticker = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(ticker);
+  }, []);
+
   const isDark = theme === 'dark';
+
+  const buildScheduleObject = (overrides: Partial<AutoBackupSchedule> = {}): AutoBackupSchedule => {
+    const nextFreq = overrides.frequency ?? frequency;
+    const nextIntHours = overrides.intervalHours ?? intervalHours;
+    const nextTime = overrides.timeOfDay ?? timeOfDay;
+    const nextDay = overrides.dayOfWeek ?? dayOfWeek;
+    const nextScope = overrides.targetScope ?? targetScope;
+    const nextSelIds = overrides.selectedServerIds ?? selectedServerIds;
+    const nextStrategy = overrides.autoDeleteStrategy ?? autoDeleteStrategy;
+    const nextRetCount = overrides.retentionCount ?? retentionCount;
+
+    const effectiveSelected =
+      nextScope === 'all'
+        ? servers.map((s) => s.id)
+        : nextSelIds.length > 0
+        ? nextSelIds
+        : [servers[0]?.id].filter(Boolean);
+
+    const nextRunAt =
+      overrides.nextRunAt ||
+      calculateNextScheduleRun({
+        frequency: nextFreq,
+        intervalHours: nextIntHours,
+        timeOfDay: nextTime,
+        dayOfWeek: nextDay,
+      });
+
+    return {
+      enabled: overrides.enabled ?? enabled,
+      frequency: nextFreq,
+      intervalHours: nextIntHours,
+      timeOfDay: nextTime,
+      dayOfWeek: nextDay,
+      targetScope: nextScope,
+      selectedServerIds: effectiveSelected,
+      retentionCount: nextStrategy === 'delete_all_previous' ? 1 : nextRetCount,
+      autoDeletePrevious: overrides.autoDeletePrevious ?? autoDeletePrevious,
+      autoDeleteStrategy: nextStrategy,
+      lockNewBackups: overrides.lockNewBackups ?? lockNewBackups,
+      saveToGoogleDrive: overrides.saveToGoogleDrive ?? saveToGoogleDrive,
+      lastRunAt: schedule.lastRunAt,
+      nextRunAt,
+    };
+  };
 
   const handleToggleServerInSchedule = (srvId: string) => {
     setSelectedServerIds((prev) =>
@@ -79,53 +160,67 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     );
   };
 
+  const handleQuickToggleEnabled = () => {
+    const nextEnabled = !enabled;
+    setEnabled(nextEnabled);
+    const updated = buildScheduleObject({
+      enabled: nextEnabled,
+      saveToGoogleDrive: nextEnabled ? true : saveToGoogleDrive,
+    });
+    if (nextEnabled) {
+      setSaveToGoogleDrive(true);
+    }
+    onUpdateSchedule(updated);
+
+    if (nextEnabled && runImmediatelyOnSave) {
+      onTriggerScheduledRunNow(updated);
+      setSaveFeedback(
+        'Auto-Backup diaktifkan! Menjalankan siklus backup pertama sekarang dan mengunggah ke Google Drive...'
+      );
+    } else {
+      setSaveFeedback(
+        nextEnabled
+          ? `Auto-Backup diaktifkan! Eksekusi berikutnya: ${new Date(updated.nextRunAt).toLocaleString('id-ID')}`
+          : 'Auto-Backup dinonaktifkan.'
+      );
+    }
+    setTimeout(() => setSaveFeedback(null), 6000);
+  };
+
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    const effectiveSelected =
-      targetScope === 'all'
-        ? servers.map((s) => s.id)
-        : selectedServerIds.length > 0
-        ? selectedServerIds
-        : [servers[0]?.id].filter(Boolean);
-
-    const nextRunAt = calculateNextScheduleRun({
-      frequency,
-      intervalHours,
-      timeOfDay,
-      dayOfWeek,
-    });
-
-    const nextSchedule: AutoBackupSchedule = {
-      enabled,
-      frequency,
-      intervalHours,
-      timeOfDay,
-      dayOfWeek,
-      targetScope,
-      selectedServerIds: effectiveSelected,
-      retentionCount: autoDeleteStrategy === 'delete_all_previous' ? 1 : retentionCount,
-      autoDeletePrevious,
-      autoDeleteStrategy,
-      lockNewBackups,
-      saveToGoogleDrive,
-      lastRunAt: schedule.lastRunAt,
-      nextRunAt,
-    };
+    // When user clicks Save on the scheduler form, ensure enabled is true so their schedule actually runs
+    const effectiveEnabled = true;
+    setEnabled(true);
+    const nextSchedule = buildScheduleObject({ enabled: effectiveEnabled });
 
     onUpdateSchedule(nextSchedule);
-    setSaveFeedback(
-      `Jadwal Auto-Update berhasil disimpan (${
-        autoDeletePrevious
-          ? autoDeleteStrategy === 'delete_all_previous'
-            ? 'Otomatis hapus semua backup sebelumnya di Pterodactyl'
-            : `Otomatis hapus backup lama di atas ${retentionCount} file`
-          : 'Tanpa hapus otomatis'
-      } · ${
-        saveToGoogleDrive ? 'Simpan ke Google Drive + Panel' : 'Simpan di Panel Pterodactyl'
-      }). Eksekusi berikutnya: ${new Date(nextRunAt).toLocaleString('id-ID')}`
-    );
-    setTimeout(() => setSaveFeedback(null), 5000);
+
+    if (runImmediatelyOnSave) {
+      onTriggerScheduledRunNow(nextSchedule);
+      setSaveFeedback(
+        `Pengaturan Auto-Backup disimpan & diaktifkan! Menjalankan backup pertama sekarang ke ${
+          nextSchedule.saveToGoogleDrive ? 'Panel + Google Drive' : 'Panel Pterodactyl'
+        }, lalu berlanjut otomatis sesuai jadwal.`
+      );
+    } else {
+      setSaveFeedback(
+        `Jadwal Auto-Update berhasil disimpan & diaktifkan (${
+          autoDeletePrevious
+            ? autoDeleteStrategy === 'delete_all_previous'
+              ? 'Otomatis hapus semua backup sebelumnya di Pterodactyl'
+              : `Otomatis hapus backup lama di atas ${retentionCount} file`
+            : 'Tanpa hapus otomatis'
+        } · ${
+          saveToGoogleDrive ? 'Simpan ke Google Drive + Panel' : 'Simpan di Panel Pterodactyl'
+        }). Eksekusi berikutnya: ${new Date(nextSchedule.nextRunAt).toLocaleString('id-ID')}`
+      );
+    }
+    setTimeout(() => setSaveFeedback(null), 6000);
   };
+
+  const remainingMs = Math.max(0, new Date(schedule.nextRunAt).getTime() - nowMs);
+  const countdownText = formatCountdownMs(remainingMs);
 
   return (
     <section
@@ -137,47 +232,151 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-current/10">
         <div className="min-w-0">
           <p className={`text-xs font-medium mb-1 ${isDark ? 'text-red-400' : 'text-blue-600'}`}>
-            Otomatisasi Pencadangan Terjadwal &amp; Google Drive
+            Otomatisasi Pencadangan Terjadwal &amp; Google Drive Real-Time
           </p>
           <h2 id="scheduler-heading" className="text-lg sm:text-xl font-bold tracking-tight">
             Konfigurasi Auto-Update Backup &amp; Penyimpanan Google Drive
           </h2>
           <p className={`text-xs mt-1 ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
-            Tentukan waktu eksekusi otomatis dan pilih apakah hasil backup otomatis juga langsung disimpan ke folder terpisah di Google Drive Anda.
+            Sistem memantau kompresi Wings hingga selesai (<code className="font-mono">completed</code>) sebelum mengunggah arsip <code className="font-mono">.tar.gz</code> ke folder terpisah di Google Drive Anda.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
           <button
             type="button"
-            onClick={() => setEnabled(!enabled)}
+            onClick={handleQuickToggleEnabled}
             role="switch"
             aria-checked={enabled}
             className={`px-3.5 py-2 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
               enabled
                 ? isDark
-                  ? 'bg-red-600/20 border-red-500 text-red-300'
-                  : 'bg-blue-50 border-blue-600 text-blue-700'
+                  ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                  : 'bg-emerald-50 border-emerald-600 text-emerald-800'
                 : isDark
                 ? 'bg-zinc-900 border-zinc-700 text-zinc-400'
                 : 'bg-slate-100 border-slate-300 text-slate-600'
             }`}
           >
-            Status Auto-Update: {enabled ? 'Aktif' : 'Nonaktif'}
+            Status Auto-Update: {enabled ? 'AKTIF (Berjalan)' : 'Nonaktif (Klik untuk Aktifkan)'}
           </button>
 
           <button
             type="button"
-            onClick={onTriggerScheduledRunNow}
-            className={`px-3.5 py-2 text-xs font-semibold rounded-lg border flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+            disabled={isRunningAutoBackup}
+            onClick={() => {
+              const currentObj = buildScheduleObject({ enabled: true, saveToGoogleDrive: true });
+              setEnabled(true);
+              setSaveToGoogleDrive(true);
+              onUpdateSchedule(currentObj);
+              onTriggerScheduledRunNow(currentObj);
+            }}
+            className={`px-3.5 py-2 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 text-white ${
               isDark
-                ? 'border-[#27272A] bg-zinc-900 text-zinc-100 hover:bg-zinc-800'
-                : 'border-slate-300 bg-slate-50 text-slate-800 hover:bg-slate-100'
+                ? 'bg-red-600 hover:bg-red-500 disabled:opacity-60'
+                : 'bg-blue-600 hover:bg-blue-700 disabled:opacity-60'
             }`}
           >
-            <Play className="w-3.5 h-3.5" />
-            Jalankan Siklus Auto-Update Sekarang
+            {isRunningAutoBackup ? (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                Memproses Auto-Backup ke Drive...
+              </>
+            ) : (
+              <>
+                <Play className="w-3.5 h-3.5" />
+                Jalankan Auto-Backup ke Drive Sekarang
+              </>
+            )}
           </button>
+        </div>
+      </div>
+
+      {/* Live Countdown & Real-Time Telemetry Banner */}
+      <div
+        className={`mt-5 p-4 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-4 ${
+          enabled
+            ? isDark
+              ? 'bg-emerald-950/20 border-emerald-700/50'
+              : 'bg-emerald-50/70 border-emerald-200'
+            : isDark
+            ? 'bg-[#09090B] border-[#242429]'
+            : 'bg-slate-50 border-slate-200'
+        }`}
+      >
+        <div className="flex items-start sm:items-center gap-3 min-w-0">
+          <div
+            className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 font-mono text-xs font-bold ${
+              enabled
+                ? isDark
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                  : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                : isDark
+                ? 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                : 'bg-slate-200 text-slate-600'
+            }`}
+          >
+            <Clock className="w-5 h-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-bold uppercase tracking-wider">
+                {enabled ? 'Timer Auto-Backup Aktif' : 'Timer Auto-Backup Belum Aktif'}
+              </span>
+              <span
+                className={`px-2 py-0.5 text-[11px] rounded font-medium ${
+                  saveToGoogleDrive && isDriveConnected
+                    ? isDark
+                      ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/60'
+                      : 'bg-emerald-100 text-emerald-800'
+                    : isDark
+                    ? 'bg-amber-950/80 text-amber-300 border border-amber-700/60'
+                    : 'bg-amber-100 text-amber-800'
+                }`}
+              >
+                {saveToGoogleDrive
+                  ? isDriveConnected
+                    ? 'Google Drive Terhubung (Siap Upload Otomatis)'
+                    : 'Google Drive Belum Terhubung!'
+                  : 'Hanya Simpan di Panel'}
+              </span>
+            </div>
+            <p className={`text-xs mt-1 ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
+              {schedule.lastRunAt
+                ? `Backup otomatis terakhir berhasil dijalankan pada: ${new Date(
+                    schedule.lastRunAt
+                  ).toLocaleString('id-ID')}`
+                : 'Klik "Simpan & Aktifkan Auto-Backup" atau "Jalankan Auto-Backup ke Drive Sekarang" untuk memulai siklus pertama.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-4 shrink-0">
+          <div
+            className={`px-3.5 py-2 rounded-lg border font-mono tabular-nums ${
+              isDark ? 'bg-[#09090B] border-[#27272A]' : 'bg-white border-slate-200'
+            }`}
+          >
+            <div className={`text-[10px] uppercase ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
+              Hitung Mundur Backup Berikutnya
+            </div>
+            <div className="text-base font-bold tracking-wider">
+              {enabled ? countdownText : '--:--:--'}
+            </div>
+          </div>
+
+          {!isDriveConnected && (
+            <button
+              type="button"
+              onClick={onRequestGoogleSignIn}
+              className={`px-3.5 py-2.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 text-white shrink-0 ${
+                isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
+              }`}
+            >
+              <CloudUpload className="w-4 h-4" />
+              Hubungkan Google Drive
+            </button>
+          )}
         </div>
       </div>
 
@@ -191,14 +390,20 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
             <select
               id="schedule-frequency"
               value={frequency}
-              onChange={(e) => setFrequency(e.target.value as ScheduleFrequency)}
+              onChange={(e) => {
+                const nextFreq = e.target.value as ScheduleFrequency;
+                setFrequency(nextFreq);
+                if (enabled) {
+                  onUpdateSchedule(buildScheduleObject({ frequency: nextFreq }));
+                }
+              }}
               className={`w-full px-3.5 py-2.5 text-sm rounded-lg border transition-colors ${
                 isDark
                   ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
                   : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
               }`}
             >
-              <option value="interval_hours">Interval Jam (Setiap X Jam)</option>
+              <option value="interval_hours">Interval Waktu (Setiap X Menit / Jam)</option>
               <option value="daily">Harian pada Jam Tertentu</option>
               <option value="weekly">Mingguan pada Hari &amp; Jam Tertentu</option>
             </select>
@@ -208,23 +413,29 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
           {frequency === 'interval_hours' ? (
             <div>
               <label htmlFor="schedule-interval-hours" className="block text-sm font-medium mb-2">
-                Rentang Interval (Jam)
+                Rentang Interval Auto-Backup
               </label>
               <select
                 id="schedule-interval-hours"
                 value={intervalHours}
-                onChange={(e) => setIntervalHours(Number(e.target.value))}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setIntervalHours(val);
+                  if (enabled) {
+                    onUpdateSchedule(buildScheduleObject({ intervalHours: val }));
+                  }
+                }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
                   isDark
                     ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
                     : 'bg-slate-50 border-slate-300 text-slate-900 focus:border-blue-600'
                 }`}
               >
-                <option value={1}>Setiap 1 Jam</option>
-                <option value={3}>Setiap 3 Jam</option>
-                <option value={6}>Setiap 6 Jam</option>
-                <option value={12}>Setiap 12 Jam</option>
-                <option value={24}>Setiap 24 Jam</option>
+                {INTERVAL_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
               </select>
             </div>
           ) : (
@@ -242,7 +453,13 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                   id="schedule-time-of-day"
                   type="time"
                   value={timeOfDay}
-                  onChange={(e) => setTimeOfDay(e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setTimeOfDay(val);
+                    if (enabled) {
+                      onUpdateSchedule(buildScheduleObject({ timeOfDay: val }));
+                    }
+                  }}
                   className={`w-full pl-10 pr-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
                     isDark
                       ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
@@ -262,7 +479,13 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               <select
                 id="schedule-day-of-week"
                 value={dayOfWeek}
-                onChange={(e) => setDayOfWeek(Number(e.target.value))}
+                onChange={(e) => {
+                  const val = Number(e.target.value);
+                  setDayOfWeek(val);
+                  if (enabled) {
+                    onUpdateSchedule(buildScheduleObject({ dayOfWeek: val }));
+                  }
+                }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border transition-colors ${
                   isDark
                     ? 'bg-[#09090B] border-[#27272A] text-zinc-100 focus:border-red-500'
@@ -286,11 +509,17 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 value={autoDeleteStrategy === 'delete_all_previous' ? 1 : retentionCount}
                 onChange={(e) => {
                   const val = Number(e.target.value);
+                  const nextStrat: AutoDeleteStrategy =
+                    val === 1 ? 'delete_all_previous' : 'keep_retention_count';
                   setRetentionCount(val);
-                  if (val === 1) {
-                    setAutoDeleteStrategy('delete_all_previous');
-                  } else {
-                    setAutoDeleteStrategy('keep_retention_count');
+                  setAutoDeleteStrategy(nextStrat);
+                  if (enabled) {
+                    onUpdateSchedule(
+                      buildScheduleObject({
+                        retentionCount: val,
+                        autoDeleteStrategy: nextStrat,
+                      })
+                    );
                   }
                 }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
@@ -349,7 +578,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               >
                 <button
                   type="button"
-                  onClick={() => setAutoDeletePrevious(true)}
+                  onClick={() => {
+                    setAutoDeletePrevious(true);
+                    if (enabled) {
+                      onUpdateSchedule(buildScheduleObject({ autoDeletePrevious: true }));
+                    }
+                  }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                     autoDeletePrevious
                       ? isDark
@@ -364,7 +598,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 </button>
                 <button
                   type="button"
-                  onClick={() => setAutoDeletePrevious(false)}
+                  onClick={() => {
+                    setAutoDeletePrevious(false);
+                    if (enabled) {
+                      onUpdateSchedule(buildScheduleObject({ autoDeletePrevious: false }));
+                    }
+                  }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                     !autoDeletePrevious
                       ? isDark
@@ -392,6 +631,14 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                   onClick={() => {
                     setAutoDeleteStrategy('delete_all_previous');
                     setRetentionCount(1);
+                    if (enabled) {
+                      onUpdateSchedule(
+                        buildScheduleObject({
+                          autoDeleteStrategy: 'delete_all_previous',
+                          retentionCount: 1,
+                        })
+                      );
+                    }
                   }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                     autoDeleteStrategy === 'delete_all_previous'
@@ -408,8 +655,17 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 <button
                   type="button"
                   onClick={() => {
+                    const nextRet = retentionCount <= 1 ? 3 : retentionCount;
                     setAutoDeleteStrategy('keep_retention_count');
-                    if (retentionCount <= 1) setRetentionCount(3);
+                    setRetentionCount(nextRet);
+                    if (enabled) {
+                      onUpdateSchedule(
+                        buildScheduleObject({
+                          autoDeleteStrategy: 'keep_retention_count',
+                          retentionCount: nextRet,
+                        })
+                      );
+                    }
                   }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
                     autoDeleteStrategy === 'keep_retention_count'
@@ -452,7 +708,7 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                   Pilihan Penyimpanan Google Drive untuk Backup Otomatis (Auto-Update)
                 </div>
                 <p className={`text-xs mt-0.5 ${isDark ? 'text-zinc-400' : 'text-slate-600'}`}>
-                  Jika diaktifkan, setiap kali jadwal Auto-Update berjalan, file backup tiap server akan otomatis diunggah ke folder terpisah (<code className="font-mono">PteroVault_Backups/Server_01_...</code>) di Google Drive Anda.
+                  Jika diaktifkan, setiap kali jadwal Auto-Update berjalan, sistem menunggu kompresi backup selesai di Wings lalu otomatis mengunggahnya ke folder (<code className="font-mono">PteroVault_Backups/Server_01_...</code>) di Google Drive Anda.
                 </p>
               </div>
             </div>
@@ -465,7 +721,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               >
                 <button
                   type="button"
-                  onClick={() => setSaveToGoogleDrive(false)}
+                  onClick={() => {
+                    setSaveToGoogleDrive(false);
+                    if (enabled) {
+                      onUpdateSchedule(buildScheduleObject({ saveToGoogleDrive: false }));
+                    }
+                  }}
                   className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                     !saveToGoogleDrive
                       ? isDark
@@ -482,6 +743,9 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                   type="button"
                   onClick={() => {
                     setSaveToGoogleDrive(true);
+                    if (enabled) {
+                      onUpdateSchedule(buildScheduleObject({ saveToGoogleDrive: true }));
+                    }
                     if (!isDriveConnected) {
                       onRequestGoogleSignIn();
                     }
@@ -520,7 +784,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
             >
               <button
                 type="button"
-                onClick={() => setTargetScope('all')}
+                onClick={() => {
+                  setTargetScope('all');
+                  if (enabled) {
+                    onUpdateSchedule(buildScheduleObject({ targetScope: 'all' }));
+                  }
+                }}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   targetScope === 'all'
                     ? isDark
@@ -535,7 +804,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               </button>
               <button
                 type="button"
-                onClick={() => setTargetScope('selected')}
+                onClick={() => {
+                  setTargetScope('selected');
+                  if (enabled) {
+                    onUpdateSchedule(buildScheduleObject({ targetScope: 'selected' }));
+                  }
+                }}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   targetScope === 'selected'
                     ? isDark
@@ -594,22 +868,38 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
           )}
         </div>
 
-        {/* Lock option & Next Run Info */}
-        <div className="pt-4 border-t border-current/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums">
-            <label className="inline-flex items-center gap-2 cursor-pointer font-sans">
+        {/* Lock option, Immediate First Run option & Next Run Info */}
+        <div className="pt-4 border-t border-current/10 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3 text-xs">
+            <label className="inline-flex items-center gap-2 cursor-pointer font-medium">
+              <input
+                type="checkbox"
+                checked={runImmediatelyOnSave}
+                onChange={(e) => setRunImmediatelyOnSave(e.target.checked)}
+                className="rounded"
+              />
+              <span>Langsung jalankan backup pertama ke Google Drive saat disimpan</span>
+            </label>
+
+            <span aria-hidden="true" className="hidden sm:inline opacity-30">
+              |
+            </span>
+
+            <label className="inline-flex items-center gap-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={lockNewBackups}
                 onChange={(e) => setLockNewBackups(e.target.checked)}
                 className="rounded"
               />
-              <span>Kunci otomatis file hasil Auto-Update di Panel</span>
+              <span>Kunci otomatis file di Panel</span>
             </label>
-            <span aria-hidden="true" className="opacity-30">
+
+            <span aria-hidden="true" className="hidden sm:inline opacity-30">
               |
             </span>
-            <span className="inline-flex items-center gap-1.5">
+
+            <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
               <CalendarCheck className={`w-4 h-4 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
               Jadwal Berikutnya:{' '}
               {new Date(schedule.nextRunAt).toLocaleString('id-ID', {
@@ -618,30 +908,37 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 year: 'numeric',
                 hour: '2-digit',
                 minute: '2-digit',
+                second: '2-digit',
               })}
             </span>
           </div>
 
           <button
             type="submit"
-            className={`px-5 py-2.5 text-xs font-semibold text-white rounded-lg flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 ${
-              isDark ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-700'
+            disabled={isRunningAutoBackup}
+            className={`px-5 py-2.5 text-xs font-semibold text-white rounded-lg flex items-center justify-center gap-2 transition-colors whitespace-nowrap shrink-0 ${
+              isDark
+                ? 'bg-red-600 hover:bg-red-500 disabled:opacity-60'
+                : 'bg-blue-600 hover:bg-blue-700 disabled:opacity-60'
             }`}
           >
             <Save className="w-4 h-4" />
-            Simpan Pengaturan Auto-Update
+            {runImmediatelyOnSave
+              ? 'Simpan, Aktifkan & Backup ke Drive Sekarang'
+              : 'Simpan & Aktifkan Jadwal Auto-Update'}
           </button>
         </div>
 
         {saveFeedback && (
           <div
-            className={`p-3 rounded-lg border text-xs font-medium break-words ${
+            className={`p-3 rounded-lg border text-xs font-medium flex items-center gap-2 break-words ${
               isDark
                 ? 'bg-emerald-950/40 border-emerald-800/60 text-emerald-300'
                 : 'bg-emerald-50 border-emerald-200 text-emerald-800'
             }`}
           >
-            {saveFeedback}
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+            <span>{saveFeedback}</span>
           </div>
         )}
       </form>

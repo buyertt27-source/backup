@@ -537,6 +537,61 @@ export function createApiApp() {
   });
 
   /**
+   * POST /api/pterodactyl/backup/status
+   * Checks whether a newly created backup on Pterodactyl Wings has finished compressing
+   */
+  app.post('/api/pterodactyl/backup/status', async (req, res) => {
+    try {
+      const { domain, pltsKey, serverIdentifier, backupUuid } = req.body || {};
+      const baseUrl = cleanDomain(domain);
+      const plts = (pltsKey || '').trim();
+
+      if (!baseUrl || !plts || !serverIdentifier || !backupUuid) {
+        res.status(400).json({ ok: false, error: 'Parameter tidak lengkap.' });
+        return;
+      }
+
+      const response = await fetchWithTimeout(
+        `${baseUrl}/api/client/servers/${serverIdentifier}/backups/${backupUuid}`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${plts}`,
+            Accept: 'Application/vnd.pterodactyl.v1+json',
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+
+      if (!response.ok) {
+        res.status(response.status).json({
+          ok: false,
+          error: `Gagal memeriksa status backup (HTTP ${response.status}).`,
+        });
+        return;
+      }
+
+      const data = (await response.json()) as any;
+      const bAttr = data?.attributes || {};
+      const completedAt = bAttr.completed_at || null;
+      const isSuccessful = bAttr.is_successful !== false;
+      res.json({
+        ok: true,
+        completedAt,
+        isSuccessful,
+        sizeBytes: Number(bAttr.bytes || 0),
+        checksum: String(bAttr.checksum || 'sha256:completed'),
+        status: completedAt ? (isSuccessful ? 'completed' : 'failed') : 'in_progress',
+      });
+    } catch (err: any) {
+      res.status(502).json({
+        ok: false,
+        error: `Gagal memeriksa status backup: ${err?.message || 'Network error'}`,
+      });
+    }
+  });
+
+  /**
    * POST /api/pterodactyl/backup/download
    * Requests a real signed download URL from Wings via Pterodactyl Client API
    */
@@ -828,6 +883,10 @@ export function createApiApp() {
               serverFolderName: serverFolderName || `Server_${serverIdentifier}`,
               fileName: targetFileName,
               signedWingsUrl,
+              domain: baseUrl,
+              pltsKey: plts,
+              serverIdentifier,
+              backupUuid,
               base64Payload: Buffer.from(fallbackJson, 'utf-8').toString('base64'),
               mimeType: 'application/gzip',
             }),

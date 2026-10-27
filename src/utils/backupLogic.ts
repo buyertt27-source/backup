@@ -198,7 +198,8 @@ export function executeBackupForServers(
 }
 
 /**
- * Computes the next scheduled execution timestamp from an AutoBackupSchedule configuration
+ * Computes the next scheduled execution timestamp from an AutoBackupSchedule configuration.
+ * Supports fractional intervalHours (e.g. 0.0833 = 5 min, 0.25 = 15 min, 0.5 = 30 min, 1 = 1 hour).
  */
 export function calculateNextScheduleRun(
   schedule: Pick<AutoBackupSchedule, 'frequency' | 'intervalHours' | 'timeOfDay' | 'dayOfWeek'>,
@@ -207,10 +208,9 @@ export function calculateNextScheduleRun(
   const next = new Date(baseDate.getTime());
 
   if (schedule.frequency === 'interval_hours') {
-    const hours = Math.max(1, schedule.intervalHours || 6);
-    next.setHours(next.getHours() + hours);
-    next.setMinutes(0, 0, 0);
-    return next.toISOString();
+    const hours = Number(schedule.intervalHours) > 0 ? Number(schedule.intervalHours) : 1;
+    const msToAdd = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
+    return new Date(baseDate.getTime() + msToAdd).toISOString();
   }
 
   const [hhStr, mmStr] = (schedule.timeOfDay || '03:00').split(':');
@@ -234,6 +234,24 @@ export function calculateNextScheduleRun(
   }
   next.setDate(next.getDate() + daysUntil);
   return next.toISOString();
+}
+
+/**
+ * Formats remaining milliseconds until next scheduled backup into HH:MM:SS
+ */
+export function formatCountdownMs(msRemaining: number): string {
+  if (!Number.isFinite(msRemaining) || msRemaining <= 0) {
+    return '00:00:00';
+  }
+  const totalSeconds = Math.ceil(msRemaining / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    String(hours).padStart(2, '0'),
+    String(minutes).padStart(2, '0'),
+    String(seconds).padStart(2, '0'),
+  ].join(':');
 }
 
 /**
@@ -360,30 +378,81 @@ export function validateAppsScriptUrl(rawUrl: string): { valid: boolean; cleanUr
 }
 
 /**
- * Generates the ready-to-paste Google Apps Script code (doPost) that acts as a permanent,
+ * Generates the ready-to-paste Google Apps Script code (doPost + 24/7 Cron) that acts as a permanent,
  * zero-OAuth Google Drive bridge for PteroVault Backups (works on Vercel 24/7 without token expiry).
  */
-export function buildGoogleAppsScriptCode(defaultFolderId = ''): string {
+export function buildGoogleAppsScriptCode(
+  defaultFolderId = '',
+  pteroConfig?: { domain?: string; pltsKey?: string }
+): string {
   const cleanFolderId = extractDriveFolderId(defaultFolderId);
-  return `// PteroVault -> Google Drive Bridge (100% Tanpa OAuth & Anti-Expired untuk Vercel)
+  const cleanDomain = normalizePanelDomain(pteroConfig?.domain || '');
+  const cleanPlts = (pteroConfig?.pltsKey || '').trim();
+
+  return `// PteroVault -> Google Drive Bridge & Auto-Backup 24/7 (100% Tanpa OAuth & Anti-Expired)
 // Tempel kode ini di https://script.google.com -> Klik Deploy -> New deployment -> Web app -> Anyone -> Copy URL
 
 var DEFAULT_FOLDER_ID = "${cleanFolderId}";
+var DEFAULT_PTERO_DOMAIN = "${cleanDomain}";
+var DEFAULT_PTERO_PLTS_KEY = "${cleanPlts}";
+
+function getTargetRootFolder(folderIdToUse, rootName) {
+  var rootFolder = null;
+  if (folderIdToUse) {
+    try { rootFolder = DriveApp.getFolderById(folderIdToUse); } catch (err) {}
+  }
+  if (!rootFolder) {
+    var name = rootName || "PteroVault_Backups";
+    var roots = DriveApp.getFoldersByName(name);
+    rootFolder = roots.hasNext() ? roots.next() : DriveApp.createFolder(name);
+  }
+  return rootFolder;
+}
+
+function pollAndFetchWingsDownloadUrl(domain, pltsKey, serverIdentifier, backupUuid) {
+  if (!domain || !pltsKey || !serverIdentifier || !backupUuid) return null;
+  var baseUrl = String(domain).replace(/\\/+$/, "");
+  var headers = {
+    "Authorization": "Bearer " + pltsKey,
+    "Accept": "Application/vnd.pterodactyl.v1+json",
+    "Content-Type": "application/json"
+  };
+
+  for (var i = 0; i < 20; i++) {
+    try {
+      var checkRes = UrlFetchApp.fetch(
+        baseUrl + "/api/client/servers/" + serverIdentifier + "/backups/" + backupUuid,
+        { method: "get", headers: headers, muteHttpExceptions: true }
+      );
+      if (checkRes.getResponseCode() >= 200 && checkRes.getResponseCode() < 300) {
+        var checkJson = JSON.parse(checkRes.getContentText());
+        var attr = (checkJson && checkJson.attributes) || {};
+        if (attr.completed_at) {
+          break;
+        }
+      }
+    } catch (e) {}
+    Utilities.sleep(2500);
+  }
+
+  try {
+    var dlRes = UrlFetchApp.fetch(
+      baseUrl + "/api/client/servers/" + serverIdentifier + "/backups/" + backupUuid + "/download",
+      { method: "get", headers: headers, muteHttpExceptions: true }
+    );
+    if (dlRes.getResponseCode() >= 200 && dlRes.getResponseCode() < 300) {
+      var dlJson = JSON.parse(dlRes.getContentText());
+      return (dlJson && dlJson.attributes && dlJson.attributes.url) || dlJson.url || null;
+    }
+  } catch (e) {}
+  return null;
+}
 
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
-    var rootFolder = null;
     var folderIdToUse = data.targetFolderId || DEFAULT_FOLDER_ID;
-
-    if (folderIdToUse) {
-      try { rootFolder = DriveApp.getFolderById(folderIdToUse); } catch (err) {}
-    }
-    if (!rootFolder) {
-      var rootName = data.rootFolderName || "PteroVault_Backups";
-      var roots = DriveApp.getFoldersByName(rootName);
-      rootFolder = roots.hasNext() ? roots.next() : DriveApp.createFolder(rootName);
-    }
+    var rootFolder = getTargetRootFolder(folderIdToUse, data.rootFolderName);
 
     if (data.action === "ping") {
       return ContentService.createTextOutput(JSON.stringify({
@@ -415,10 +484,18 @@ function doPost(e) {
 
     var fileName = data.fileName || ("backup_" + new Date().getTime() + ".tar.gz");
     var blob = null;
+    var wingsUrl = data.signedWingsUrl || null;
 
-    if (data.signedWingsUrl) {
+    if (!wingsUrl && data.domain && data.pltsKey && data.serverIdentifier && data.backupUuid) {
+      wingsUrl = pollAndFetchWingsDownloadUrl(data.domain, data.pltsKey, data.serverIdentifier, data.backupUuid);
+    }
+
+    if (wingsUrl) {
       try {
-        blob = UrlFetchApp.fetch(data.signedWingsUrl, { muteHttpExceptions: true }).getBlob().setName(fileName);
+        var dlFetch = UrlFetchApp.fetch(wingsUrl, { muteHttpExceptions: true });
+        if (dlFetch.getResponseCode() >= 200 && dlFetch.getResponseCode() < 300) {
+          blob = dlFetch.getBlob().setName(fileName);
+        }
       } catch (fetchErr) {}
     }
 

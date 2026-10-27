@@ -186,13 +186,19 @@ test('selectBackupsToAutoDelete frees full slots before creation and deletes pre
   assert.equal(planAll.backupsToKeep[0].id, 'bkp-locked');
 });
 
-test('calculateNextScheduleRun computes accurate future timestamps', () => {
-  const base = new Date('2026-10-25T08:00:00.000Z');
+test('calculateNextScheduleRun computes accurate future timestamps including hourly and sub-hour intervals', () => {
+  const base = new Date('2026-10-25T08:15:30.000Z');
   const nextInterval = calculateNextScheduleRun(
-    { frequency: 'interval_hours', intervalHours: 4, timeOfDay: '03:00', dayOfWeek: 1 },
+    { frequency: 'interval_hours', intervalHours: 1, timeOfDay: '03:00', dayOfWeek: 1 },
     base
   );
-  assert.equal(new Date(nextInterval).getUTCHours(), 12);
+  assert.equal(new Date(nextInterval).getTime() - base.getTime(), 60 * 60 * 1000);
+
+  const next15Min = calculateNextScheduleRun(
+    { frequency: 'interval_hours', intervalHours: 0.25, timeOfDay: '03:00', dayOfWeek: 1 },
+    base
+  );
+  assert.equal(new Date(next15Min).getTime() - base.getTime(), 15 * 60 * 1000);
 
   const nextDaily = calculateNextScheduleRun(
     { frequency: 'daily', intervalHours: 6, timeOfDay: '22:30', dayOfWeek: 1 },
@@ -226,3 +232,4 @@ test('validateAppsScriptUrl validates Google Apps Script Web App URLs', () => {
   const invalid = validateAppsScriptUrl('https://example.com/webhook');
   assert.equal(invalid.valid, false);
 });
+

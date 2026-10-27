@@ -24,10 +24,21 @@ function buildIsolatedFileName(
 
 function getConfiguredAppsScriptUrl(): string {
   try {
-    const raw = localStorage.getItem('pterovault_drive_bridge_v1');
-    if (!raw) return '';
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.scriptUrl === 'string' ? parsed.scriptUrl.trim() : '';
+    const rawMain = localStorage.getItem('pterovault_gdrive_vercel_config_v1');
+    if (rawMain) {
+      const parsedMain = JSON.parse(rawMain);
+      if (typeof parsedMain?.appsScriptUrl === 'string' && parsedMain.appsScriptUrl.trim()) {
+        return parsedMain.appsScriptUrl.trim();
+      }
+    }
+    const rawLegacy = localStorage.getItem('pterovault_drive_bridge_v1');
+    if (rawLegacy) {
+      const parsedLegacy = JSON.parse(rawLegacy);
+      if (typeof parsedLegacy?.scriptUrl === 'string' && parsedLegacy.scriptUrl.trim()) {
+        return parsedLegacy.scriptUrl.trim();
+      }
+    }
+    return '';
   } catch {
     return '';
   }
@@ -156,7 +167,7 @@ async function smartPteroFetch(
  * to a static web host where /api/pterodactyl/* serverless routes are unavailable.
  */
 async function executeClientSidePteroFallback(
-  action: 'sync' | 'backup/create' | 'backup/download' | 'backup/lock' | 'backup/delete',
+  action: 'sync' | 'backup/create' | 'backup/status' | 'backup/download' | 'backup/lock' | 'backup/delete',
   payload: Record<string, any>
 ): Promise<{ ok: boolean; status: number; data: any }> {
   const baseUrl = cleanDomainUrl(payload.domain || '');
@@ -629,6 +640,48 @@ async function executeClientSidePteroFallback(
   }
 
   // ==========================================================================
+  // ACTION: BACKUP/STATUS
+  // ==========================================================================
+  if (action === 'backup/status') {
+    const { serverIdentifier, backupUuid } = payload;
+    const statusRes = await smartPteroFetch(
+      `${baseUrl}/api/client/servers/${serverIdentifier}/backups/${backupUuid}`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${plts}`,
+          Accept: 'Application/vnd.pterodactyl.v1+json',
+        },
+      }
+    );
+    if (!statusRes.ok) {
+      return {
+        ok: false,
+        status: statusRes.status || 400,
+        data: {
+          ok: false,
+          error: `Gagal memeriksa status backup (${statusRes.status}).`,
+        },
+      };
+    }
+    const bAttr = statusRes.data?.attributes || {};
+    const completedAt = bAttr.completed_at || null;
+    const isSuccessful = bAttr.is_successful !== false;
+    return {
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        completedAt,
+        isSuccessful,
+        sizeBytes: Number(bAttr.bytes || 0),
+        checksum: String(bAttr.checksum || 'sha256:completed'),
+        status: completedAt ? (isSuccessful ? 'completed' : 'failed') : 'in_progress',
+      },
+    };
+  }
+
+  // ==========================================================================
   // ACTION: BACKUP/DOWNLOAD
   // ==========================================================================
   if (action === 'backup/download') {
@@ -737,7 +790,7 @@ async function executeClientSidePteroFallback(
  *    automatically falls back to `executeClientSidePteroFallback`.
  */
 export async function callPteroApi(
-  action: 'sync' | 'backup/create' | 'backup/download' | 'backup/lock' | 'backup/delete',
+  action: 'sync' | 'backup/create' | 'backup/status' | 'backup/download' | 'backup/lock' | 'backup/delete',
   payload: Record<string, any>
 ): Promise<{ ok: boolean; status: number; data: any }> {
   const endpointsToTry = [
@@ -780,4 +833,63 @@ export async function callPteroApi(
 
   // Fallback for static web deployments or when proxy route is unavailable
   return await executeClientSidePteroFallback(action, payload);
+}
+
+/**
+ * Polls Pterodactyl until a newly initiated backup finishes compressing on the Wings daemon (`completed_at !== null`).
+ * This ensures that when we request `/backups/{uuid}/download` to upload to Google Drive,
+ * the `.tar.gz` archive is actually finished and ready!
+ */
+export async function waitForPteroBackupCompletion(params: {
+  domain: string;
+  pltsKey: string;
+  backup: PteroBackupFile;
+  maxAttempts?: number;
+  intervalMs?: number;
+}): Promise<PteroBackupFile> {
+  const { domain, pltsKey, backup, maxAttempts = 14, intervalMs = 2500 } = params;
+
+  if (
+    !domain ||
+    !pltsKey ||
+    !backup.uuid ||
+    backup.uuid.startsWith('drive-test-') ||
+    (backup.status === 'completed' && backup.completedAt && backup.sizeBytes > 0)
+  ) {
+    return backup;
+  }
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await new Promise((r) => setTimeout(r, attempt === 0 ? 1500 : intervalMs));
+    try {
+      const res = await callPteroApi('backup/status', {
+        domain,
+        pltsKey,
+        serverIdentifier: backup.serverIdentifier,
+        backupUuid: backup.uuid,
+      });
+
+      if (res.ok && res.data?.ok) {
+        if (res.data.status === 'failed') {
+          return {
+            ...backup,
+            status: 'failed',
+          };
+        }
+        if (res.data.completedAt || res.data.status === 'completed') {
+          return {
+            ...backup,
+            completedAt: res.data.completedAt || new Date().toISOString(),
+            sizeBytes: Number(res.data.sizeBytes) || backup.sizeBytes,
+            checksum: res.data.checksum || backup.checksum,
+            status: 'completed',
+          };
+        }
+      }
+    } catch {
+      // Ignore transient poll error and retry
+    }
+  }
+
+  return backup;
 }

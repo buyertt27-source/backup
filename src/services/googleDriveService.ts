@@ -1,6 +1,6 @@
 import { PteroBackupFile } from '../types/pterodactyl';
 import { buildBackupManifestContent } from '../utils/backupLogic';
-import { callPteroApi } from './pterodactylClient';
+import { callPteroApi, waitForPteroBackupCompletion } from './pterodactylClient';
 
 /**
  * Formats the isolated Google Drive folder name for a specific Pterodactyl server
@@ -98,7 +98,15 @@ export async function uploadBackupToGoogleDrive(params: {
   updatedSizeBytes?: number;
   updatedStatus?: 'completed' | 'in_progress' | 'failed';
 }> {
-  const { accessToken, backup, serverOrdinal, domain, pltsKey } = params;
+  const { accessToken, backup: initialBackup, serverOrdinal, domain, pltsKey } = params;
+
+  // Wait for Pterodactyl Wings daemon to finish compressing if this backup is still in_progress
+  const backup = await waitForPteroBackupCompletion({
+    domain,
+    pltsKey,
+    backup: initialBackup,
+  });
+
   const serverFolderName = buildServerDriveFolderName(
     serverOrdinal,
     backup.serverIdentifier,
@@ -138,15 +146,15 @@ export async function uploadBackupToGoogleDrive(params: {
         });
 
         if (proxyRes.ok) {
-          const proxyData = await proxyRes.json();
-          if (proxyData.ok && proxyData.driveFileId) {
+          const proxyData = await proxyRes.json().catch(() => null);
+          if (proxyData && proxyData.ok && proxyData.driveFileId) {
             return {
               driveFileId: proxyData.driveFileId,
               driveWebViewLink:
                 proxyData.webViewLink || `https://drive.google.com/file/d/${proxyData.driveFileId}/view`,
               driveFolderName: proxyData.folderName || `PteroVault_Backups/${serverFolderName}`,
-              updatedSizeBytes: proxyData.sizeBytes,
-              updatedStatus: proxyData.status,
+              updatedSizeBytes: proxyData.sizeBytes || backup.sizeBytes,
+              updatedStatus: proxyData.status || backup.status,
             };
           }
         }
@@ -188,6 +196,10 @@ export async function uploadBackupToGoogleDrive(params: {
         serverFolderName,
         fileName: backup.fileName,
         signedWingsUrl: signedWingsUrl || undefined,
+        domain: domain || undefined,
+        pltsKey: pltsKey || undefined,
+        serverIdentifier: backup.serverIdentifier,
+        backupUuid: backup.uuid,
         base64Payload,
         mimeType: 'application/gzip',
       }),
@@ -214,6 +226,7 @@ export async function uploadBackupToGoogleDrive(params: {
           : 'https://drive.google.com/drive/my-drive'),
       driveFolderName: bridgeData?.folderName || `PteroVault_Backups/${serverFolderName}`,
       updatedSizeBytes: bridgeData?.sizeBytes || backup.sizeBytes,
+      updatedStatus: 'completed',
     };
   }
 
@@ -242,15 +255,15 @@ export async function uploadBackupToGoogleDrive(params: {
       });
 
       if (proxyRes.ok) {
-        const proxyData = await proxyRes.json();
-        if (proxyData.ok && proxyData.driveFileId) {
+        const proxyData = await proxyRes.json().catch(() => null);
+        if (proxyData && proxyData.ok && proxyData.driveFileId) {
           return {
             driveFileId: proxyData.driveFileId,
             driveWebViewLink:
               proxyData.webViewLink || `https://drive.google.com/file/d/${proxyData.driveFileId}/view`,
             driveFolderName: `PteroVault_Backups/${serverFolderName}`,
-            updatedSizeBytes: proxyData.sizeBytes,
-            updatedStatus: proxyData.status,
+            updatedSizeBytes: proxyData.sizeBytes || backup.sizeBytes,
+            updatedStatus: proxyData.status || backup.status,
           };
         }
       }

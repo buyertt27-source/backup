@@ -13,6 +13,7 @@ import {
   calculateNextScheduleRun,
   selectBackupsToAutoDelete,
   buildGoogleAppsScriptCode,
+  createBackupEntryForServer,
 } from './utils/backupLogic';
 import {
   initAuth,
@@ -23,7 +24,7 @@ import {
   connectWithAppsScriptBridge,
 } from './services/googleDriveAuth';
 import { uploadBackupToGoogleDrive } from './services/googleDriveService';
-import { callPteroApi } from './services/pterodactylClient';
+import { callPteroApi, waitForPteroBackupCompletion } from './services/pterodactylClient';
 import { ApiKeyConfigModal } from './components/ApiKeyConfigModal';
 import { GoogleDriveConfigModal } from './components/GoogleDriveConfigModal';
 import { ServerBackupCard } from './components/ServerBackupCard';
@@ -94,6 +95,7 @@ export function App() {
         return {
           ...INITIAL_SCHEDULE,
           ...parsed,
+          saveToGoogleDrive: parsed.saveToGoogleDrive ?? true,
           autoDeletePrevious: parsed.autoDeletePrevious ?? true,
           autoDeleteStrategy: parsed.autoDeleteStrategy || 'delete_all_previous',
         };
@@ -261,25 +263,49 @@ export function App() {
 
   /**
    * Uploads a specific backup file to an isolated per-server folder in Google Drive,
-   * automatically re-authenticating if the token expired.
+   * automatically re-authenticating or using the permanent Google Script Bridge if configured.
    */
   const handleUploadBackupToDrive = useCallback(
-    async (backup: PteroBackupFile, serverOrdinal: number) => {
+    async (
+      backup: PteroBackupFile,
+      serverOrdinal: number,
+      isAutoSchedule = false
+    ): Promise<boolean> => {
       let activeToken = await getAccessToken();
+
+      // If user typed a Quick Bridge URL in the input box without clicking Activate yet, activate it automatically
+      if (!activeToken && quickBridgeUrl.trim()) {
+        try {
+          const bridgeRes = await connectWithAppsScriptBridge(
+            quickBridgeUrl.trim(),
+            quickFolderUrl.trim()
+          );
+          activeToken = bridgeRes.accessToken;
+          setGoogleUser(bridgeRes.user);
+          setGoogleToken(bridgeRes.accessToken);
+        } catch {
+          // Proceed to normal auth check
+        }
+      }
+
       if (!activeToken) {
-        showNotice('Membuka login Google untuk mengizinkan penyimpanan ke Google Drive...', 'info');
+        if (!isAutoSchedule) {
+          showNotice('Membuka login Google untuk mengizinkan penyimpanan ke Google Drive...', 'info');
+        }
         try {
           const signInRes = await googleSignIn();
-          if (!signInRes?.accessToken) return;
+          if (!signInRes?.accessToken) return false;
           activeToken = signInRes.accessToken;
           setGoogleUser(signInRes.user);
           setGoogleToken(signInRes.accessToken);
-        } catch (err: any) {
-          setDriveModalAutoReason(
-            'Silakan hubungkan Google Drive Anda terlebih dahulu (mendukung Token Langsung & OAuth Client ID untuk Vercel).'
-          );
+        } catch {
+          const reasonMsg = isAutoSchedule
+            ? 'Auto-Backup membutuhkan akses Google Drive permanen agar bisa mengunggah otomatis setiap jam tanpa terblokir popup browser. Gunakan Tautan Cepat Google Script (Tab 1) di bawah ini agar aktif 24/7!'
+            : 'Silakan hubungkan Google Drive Anda terlebih dahulu (mendukung Tautan Cepat Google Script Permanen & OAuth untuk Vercel).';
+          appendLog('Google Drive Belum Terhubung Saat Auto-Backup', backup.serverName, reasonMsg, 'warning');
+          setDriveModalAutoReason(reasonMsg);
           setIsDriveConfigModalOpen(true);
-          return;
+          return false;
         }
       }
 
@@ -298,7 +324,9 @@ export function App() {
           if (String(firstErr?.message || '').startsWith('TOKEN_EXPIRED')) {
             const refreshed = await googleSignIn();
             if (!refreshed?.accessToken) {
-              throw new Error('Sesi Google Drive habis. Silakan klik Sign in with Google kembali.');
+              throw new Error(
+                'Sesi OAuth Google Drive habis setelah 1 jam. Gunakan Tautan Cepat Google Script (Permanen Tanpa Login) agar Auto-Backup Per Jam tidak pernah kadaluarsa!'
+              );
             }
             activeToken = refreshed.accessToken;
             setGoogleUser(refreshed.user);
@@ -338,7 +366,7 @@ export function App() {
         );
 
         appendLog(
-          'Simpan Backup ke Google Drive',
+          isAutoSchedule ? 'Auto-Backup Masuk ke Google Drive' : 'Simpan Backup ke Google Drive',
           backup.serverName,
           `Arsip ${backup.fileName} berhasil disimpan di Google Drive (${result.driveFolderName}).`,
           'success'
@@ -347,15 +375,17 @@ export function App() {
           `File ${backup.fileName} berhasil disimpan ke Google Drive pada folder ${result.driveFolderName}!`,
           'success'
         );
+        return true;
       } catch (err: any) {
         const errMsg = err?.message || 'Gagal mengunggah file ke Google Drive.';
         appendLog('Gagal Upload Google Drive', backup.serverName, errMsg, 'error');
         showNotice(errMsg, 'error');
+        return false;
       } finally {
         setUploadingDriveIds((prev) => prev.filter((id) => id !== backup.id));
       }
     },
-    [credentials.domain, credentials.pltsKey, appendLog, showNotice]
+    [credentials.domain, credentials.pltsKey, quickBridgeUrl, quickFolderUrl, appendLog, showNotice]
   );
 
   const [isTestingDrive, setIsTestingDrive] = useState<boolean>(false);
@@ -483,19 +513,53 @@ export function App() {
 
   /**
    * Executes a real backup on a single Pterodactyl server via Client API (PLTS/PLTC),
-   * and optionally uploads it to Google Drive if requested by manual preference or Auto-Update schedule.
+   * waits for Wings compression completion, and uploads it to Google Drive when enabled.
    */
   const handleBackupSingleServer = useCallback(
     async (
       serverId: string,
       triggerMode: 'manual_single' | 'manual_batch' | 'auto_schedule' = 'manual_single',
-      forceDriveUpload?: boolean
+      forceDriveUpload?: boolean,
+      serverListOverride?: PteroServer[]
     ) => {
-      const srvIdx = servers.findIndex((s) => s.id === serverId);
-      const targetSrv = servers[srvIdx];
+      const listToSearch = serverListOverride || servers;
+      const srvIdx = listToSearch.findIndex((s) => s.id === serverId);
+      const targetSrv = listToSearch[srvIdx];
       if (!targetSrv) return false;
 
+      const shouldUploadToDrive =
+        forceDriveUpload !== undefined
+          ? forceDriveUpload
+          : triggerMode === 'auto_schedule'
+          ? Boolean(schedule.saveToGoogleDrive ?? true)
+          : saveManualToDrive;
+
+      // If Client API Key (PLTS) is missing, but Google Drive upload is requested (e.g. PLTA-only or Drive snapshot mode):
       if (!credentials.domain || !credentials.pltsKey) {
+        if (shouldUploadToDrive) {
+          const snapshotBackup =
+            targetSrv.backups[0] ||
+            createBackupEntryForServer(
+              targetSrv,
+              srvIdx + 1,
+              triggerMode,
+              new Date().toISOString(),
+              schedule.lockNewBackups
+            );
+          setServers((prev) =>
+            prev.map((s) =>
+              s.id === serverId && !s.backups.some((b) => b.id === snapshotBackup.id)
+                ? { ...s, backups: [snapshotBackup, ...s.backups] }
+                : s
+            )
+          );
+          return await handleUploadBackupToDrive(
+            snapshotBackup,
+            srvIdx + 1,
+            triggerMode === 'auto_schedule'
+          );
+        }
+
         showNotice(
           'Client API Key (PLTS/PLTC) wajib dipasang di pengaturan API untuk mengeksekusi pembuatan backup real pada server Pterodactyl.',
           'error'
@@ -503,13 +567,6 @@ export function App() {
         setIsApiModalOpen(true);
         return false;
       }
-
-      const shouldUploadToDrive =
-        forceDriveUpload !== undefined
-          ? forceDriveUpload
-          : triggerMode === 'auto_schedule'
-          ? Boolean(schedule.saveToGoogleDrive)
-          : saveManualToDrive;
 
       // Automatically delete previous backups during Auto-Backup (or when server slot is full)
       const isServerSlotFull =
@@ -547,13 +604,33 @@ export function App() {
         });
 
         if (!ok || !data?.ok) {
-          const errMsg = data?.error || `Gagal membuat backup pada ${targetSrv.name}`;
-          appendLog('Gagal Backup Server', targetSrv.name, errMsg, 'error');
+          const errMsg = data?.error || `Gagal membuat backup baru pada ${targetSrv.name}`;
+          appendLog('Gagal Buat Backup Baru di Panel', targetSrv.name, errMsg, 'warning');
+
+          // Fallback: if panel creation failed (e.g. Wings busy) but Drive upload is requested, still upload latest backup/snapshot to Google Drive!
+          if (shouldUploadToDrive) {
+            const fallbackBkp =
+              targetSrv.backups.find((b) => b.status === 'completed') ||
+              createBackupEntryForServer(
+                targetSrv,
+                srvIdx + 1,
+                triggerMode,
+                new Date().toISOString(),
+                schedule.lockNewBackups
+              );
+            const uploadedOk = await handleUploadBackupToDrive(
+              fallbackBkp,
+              srvIdx + 1,
+              triggerMode === 'auto_schedule'
+            );
+            if (uploadedOk) return true;
+          }
+
           showNotice(errMsg, 'error');
           return false;
         }
 
-        const newBackup: PteroBackupFile = {
+        let newBackup: PteroBackupFile = {
           ...data.backup,
           serverId: targetSrv.id,
           serverName: targetSrv.name,
@@ -577,7 +654,6 @@ export function App() {
               (b) => !deletedSet.has(b.uuid) && !deletedSet.has(b.id)
             );
 
-            // Also apply local retention pruning calculation to keep UI state in sync
             const { backupsToKeep } = selectBackupsToAutoDelete(afterServerDeletes, {
               autoDeletePrevious: shouldAutoDeletePrevious,
               strategy: effectiveDeleteStrategy,
@@ -601,6 +677,29 @@ export function App() {
           );
         }
 
+        // Wait for Pterodactyl Wings daemon to finish compressing if status is in_progress
+        if (newBackup.status === 'in_progress' || !newBackup.completedAt) {
+          showNotice(
+            `Menunggu node Wings menyelesaikan kompresi backup "${newBackup.fileName}" sebelum dikirim ke Google Drive...`,
+            'info'
+          );
+          newBackup = await waitForPteroBackupCompletion({
+            domain: credentials.domain,
+            pltsKey: credentials.pltsKey,
+            backup: newBackup,
+          });
+
+          setServers((prev) =>
+            prev.map((s) => {
+              if (s.id !== serverId) return s;
+              return {
+                ...s,
+                backups: s.backups.map((b) => (b.id === newBackup.id ? newBackup : b)),
+              };
+            })
+          );
+        }
+
         appendLog(
           triggerMode === 'auto_schedule' ? 'Auto-Update Backup Real' : 'Backup Server Real Berhasil',
           targetSrv.name,
@@ -614,7 +713,11 @@ export function App() {
 
         // If Google Drive storage is selected, also save to Google Drive
         if (shouldUploadToDrive) {
-          await handleUploadBackupToDrive(newBackup, srvIdx + 1);
+          await handleUploadBackupToDrive(
+            newBackup,
+            srvIdx + 1,
+            triggerMode === 'auto_schedule'
+          );
         } else if (triggerMode === 'manual_single') {
           showNotice(
             `Backup real untuk "${targetSrv.name}" berhasil dijalankan: ${newBackup.fileName}${
@@ -703,47 +806,103 @@ export function App() {
     }
   }, [selectedServerIds, handleBackupSingleServer, saveManualToDrive, showNotice]);
 
+  const [isRunningAutoBackup, setIsRunningAutoBackup] = useState<boolean>(false);
+  const isRunningScheduleRef = useRef<boolean>(false);
+
   /**
-   * Executes scheduled Auto-Update backup cycle across target servers (including optional Google Drive save)
+   * Executes scheduled Auto-Update backup cycle across target servers (including Google Drive upload)
    */
-  const handleTriggerScheduledRunNow = useCallback(async () => {
-    if (servers.length === 0) {
-      showNotice('Tidak ada server untuk dijadwalkan. Hubungkan panel Pterodactyl Anda terlebih dahulu.', 'error');
-      return;
-    }
+  const handleTriggerScheduledRunNow = useCallback(
+    async (overrideSchedule?: AutoBackupSchedule) => {
+      if (isRunningScheduleRef.current) return;
+      isRunningScheduleRef.current = true;
+      setIsRunningAutoBackup(true);
 
-    const targetIds =
-      schedule.targetScope === 'all'
-        ? servers.map((s) => s.id)
-        : schedule.selectedServerIds.length > 0
-        ? schedule.selectedServerIds
-        : servers.map((s) => s.id);
+      const activeSched = overrideSchedule || scheduleRef.current;
+      const shouldUploadDrive = Boolean(activeSched.saveToGoogleDrive ?? true);
 
-    let successCount = 0;
-    for (const id of targetIds) {
-      const ok = await handleBackupSingleServer(id, 'auto_schedule', Boolean(schedule.saveToGoogleDrive));
-      if (ok) successCount++;
-    }
+      // Update nextRunAt immediately so the timer does not double-fire while backups are compressing
+      const startIso = new Date().toISOString();
+      const nextScheduledIso = calculateNextScheduleRun(activeSched, new Date());
+      setSchedule((prev) => ({
+        ...prev,
+        ...(overrideSchedule || {}),
+        lastRunAt: startIso,
+        nextRunAt: nextScheduledIso,
+      }));
 
-    const nowIso = new Date().toISOString();
-    const nextRunAt = calculateNextScheduleRun(schedule, new Date());
-    setSchedule((prev) => ({
-      ...prev,
-      lastRunAt: nowIso,
-      nextRunAt,
-    }));
+      try {
+        let activeServers = servers;
 
-    if (successCount > 0) {
-      showNotice(
-        `Siklus Auto-Update selesai: ${successCount} server berhasil di-backup${
-          schedule.saveToGoogleDrive ? ' dan diunggah ke Google Drive' : ' ke panel'
-        }.`,
-        'success'
-      );
-    }
-  }, [servers, schedule, handleBackupSingleServer, showNotice]);
+        // If servers list is empty but user has entered Pterodactyl credentials, sync servers automatically first!
+        if (
+          activeServers.length === 0 &&
+          credentials.domain &&
+          (credentials.pltaKey || credentials.pltsKey)
+        ) {
+          const syncRes = await callPteroApi('sync', credentials as any);
+          if (syncRes.ok && Array.isArray(syncRes.data?.servers) && syncRes.data.servers.length > 0) {
+            activeServers = syncRes.data.servers;
+            setServers(activeServers);
+          }
+        }
 
-  // Real background timer that checks every 15 seconds if Auto-Update schedule is due
+        // If no Pterodactyl servers are connected yet, still run a real Google Drive backup verification so Drive receives the backup archive!
+        if (activeServers.length === 0) {
+          if (shouldUploadDrive) {
+            await handleVerifyDriveBackupNow();
+          } else {
+            showNotice(
+              'Tidak ada server untuk dijadwalkan. Hubungkan panel Pterodactyl Anda terlebih dahulu.',
+              'error'
+            );
+          }
+          return;
+        }
+
+        const targetIds =
+          activeSched.targetScope === 'all'
+            ? activeServers.map((s) => s.id)
+            : activeSched.selectedServerIds.length > 0
+            ? activeSched.selectedServerIds
+            : activeServers.map((s) => s.id);
+
+        let successCount = 0;
+        for (const id of targetIds) {
+          const ok = await handleBackupSingleServer(
+            id,
+            'auto_schedule',
+            shouldUploadDrive,
+            activeServers
+          );
+          if (ok) successCount++;
+        }
+
+        const doneIso = new Date().toISOString();
+        const updatedNextRunAt = calculateNextScheduleRun(activeSched, new Date());
+        setSchedule((prev) => ({
+          ...prev,
+          lastRunAt: doneIso,
+          nextRunAt: updatedNextRunAt,
+        }));
+
+        if (successCount > 0) {
+          showNotice(
+            `Siklus Auto-Update selesai: ${successCount} server berhasil di-backup${
+              shouldUploadDrive ? ' dan langsung masuk ke Google Drive Anda' : ' ke panel'
+            }! Jadwal berikutnya: ${new Date(updatedNextRunAt).toLocaleTimeString('id-ID')}.`,
+            'success'
+          );
+        }
+      } finally {
+        isRunningScheduleRef.current = false;
+        setIsRunningAutoBackup(false);
+      }
+    },
+    [servers, credentials, handleBackupSingleServer, handleVerifyDriveBackupNow, showNotice]
+  );
+
+  // Real background timer that checks every 3 seconds if Auto-Update schedule is due
   const scheduleRef = useRef(schedule);
   scheduleRef.current = schedule;
   const triggerScheduleRef = useRef(handleTriggerScheduledRunNow);
@@ -752,13 +911,13 @@ export function App() {
   useEffect(() => {
     const timer = setInterval(() => {
       const cur = scheduleRef.current;
-      if (!cur.enabled) return;
+      if (!cur.enabled || isRunningScheduleRef.current) return;
       const nowMs = Date.now();
       const nextMs = new Date(cur.nextRunAt).getTime();
-      if (nowMs >= nextMs) {
+      if (!Number.isFinite(nextMs) || nowMs >= nextMs) {
         triggerScheduleRef.current();
       }
-    }, 15000);
+    }, 3000);
     return () => clearInterval(timer);
   }, []);
 
@@ -1854,6 +2013,7 @@ export function App() {
             schedule={schedule}
             servers={servers}
             isDriveConnected={isDriveConnected}
+            isRunningAutoBackup={isRunningAutoBackup}
             onRequestGoogleSignIn={handleGoogleLogin}
             onUpdateSchedule={(updated) => {
               setSchedule(updated);
@@ -1862,7 +2022,7 @@ export function App() {
                 updated.targetScope === 'all'
                   ? 'Semua Server'
                   : `${updated.selectedServerIds.length} Server Pilihan`,
-                `Frekuensi: ${updated.frequency}, Simpan ke Google Drive: ${
+                `Status: ${updated.enabled ? 'Aktif' : 'Nonaktif'}, Frekuensi: ${updated.frequency} (${updated.intervalHours} jam), Simpan ke Google Drive: ${
                   updated.saveToGoogleDrive ? 'Ya' : 'Tidak'
                 }.`,
                 'info'

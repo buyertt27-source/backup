@@ -5,8 +5,8 @@ export const INITIAL_SERVERS: PteroServer[] = [];
 
 export const INITIAL_SCHEDULE: AutoBackupSchedule = {
   enabled: false,
-  frequency: 'daily',
-  intervalHours: 6,
+  frequency: 'interval_hours',
+  intervalHours: 1,
   timeOfDay: '03:00',
   dayOfWeek: 1,
   targetScope: 'all',
@@ -15,9 +15,9 @@ export const INITIAL_SCHEDULE: AutoBackupSchedule = {
   autoDeletePrevious: true,
   autoDeleteStrategy: 'delete_all_previous',
   lockNewBackups: false,
-  saveToGoogleDrive: false,
+  saveToGoogleDrive: true,
   lastRunAt: null,
-  nextRunAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  nextRunAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
 };
 
 export const INITIAL_LOGS: ActivityLog[] = [];
