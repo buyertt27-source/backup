@@ -12,6 +12,8 @@ import {
   formatBytes,
   calculateNextScheduleRun,
   ensureFutureNextRunAt,
+  shouldTriggerScheduledAutoBackup,
+  resolveTargetServersForSchedule,
   selectBackupsToAutoDelete,
   buildGoogleAppsScriptCode,
   createBackupEntryForServer,
@@ -311,9 +313,13 @@ export function App() {
       }
 
       if (!activeToken) {
-        if (!isAutoSchedule) {
-          showNotice('Membuka login Google untuk mengizinkan penyimpanan ke Google Drive...', 'info');
+        if (isAutoSchedule) {
+          const reasonMsg =
+            'Auto-Backup ke Panel Pterodactyl tetap berjalan, namun Google Drive belum memiliki koneksi aktif. Aktifkan Tautan Cepat Google Script (Permanen Tanpa Login) agar file otomatis masuk ke Google Drive 24/7.';
+          appendLog('Info Google Drive Saat Auto-Backup', backup.serverName, reasonMsg, 'info');
+          return false;
         }
+        showNotice('Membuka login Google untuk mengizinkan penyimpanan ke Google Drive...', 'info');
         try {
           const signInRes = await googleSignIn();
           if (!signInRes?.accessToken) return false;
@@ -321,10 +327,9 @@ export function App() {
           setGoogleUser(signInRes.user);
           setGoogleToken(signInRes.accessToken);
         } catch {
-          const reasonMsg = isAutoSchedule
-            ? 'Auto-Backup membutuhkan akses Google Drive permanen agar bisa mengunggah otomatis setiap jam tanpa terblokir popup browser. Gunakan Tautan Cepat Google Script (Tab 1) di bawah ini agar aktif 24/7!'
-            : 'Silakan hubungkan Google Drive Anda terlebih dahulu (mendukung Tautan Cepat Google Script Permanen & OAuth untuk Vercel).';
-          appendLog('Google Drive Belum Terhubung Saat Auto-Backup', backup.serverName, reasonMsg, 'warning');
+          const reasonMsg =
+            'Silakan hubungkan Google Drive Anda terlebih dahulu (mendukung Tautan Cepat Google Script Permanen & OAuth untuk Vercel).';
+          appendLog('Google Drive Belum Terhubung', backup.serverName, reasonMsg, 'warning');
           setDriveModalAutoReason(reasonMsg);
           setIsDriveConfigModalOpen(true);
           return false;
@@ -374,7 +379,11 @@ export function App() {
                 b.id === backup.id
                   ? {
                       ...b,
-                      sizeBytes: result.updatedSizeBytes || b.sizeBytes,
+                      sizeBytes: Math.max(
+                        result.updatedSizeBytes || 0,
+                        b.sizeBytes || 0,
+                        backup.sizeBytes || 0
+                      ),
                       status: result.updatedStatus || b.status,
                       driveFileId: result.driveFileId,
                       driveWebViewLink: result.driveWebViewLink,
@@ -544,20 +553,24 @@ export function App() {
       forceDriveUpload?: boolean,
       serverListOverride?: PteroServer[]
     ) => {
-      const listToSearch = serverListOverride || servers;
-      const srvIdx = listToSearch.findIndex((s) => s.id === serverId);
+      const listToSearch = serverListOverride || serversRef.current || servers;
+      const srvIdx = listToSearch.findIndex(
+        (s) => s.id === serverId || s.uuid === serverId || s.identifier === serverId
+      );
       const targetSrv = listToSearch[srvIdx];
       if (!targetSrv) return false;
+      const canonicalServerId = targetSrv.id;
+      const activeCreds = credentialsRef.current || credentials;
 
       const shouldUploadToDrive =
         forceDriveUpload !== undefined
           ? forceDriveUpload
           : triggerMode === 'auto_schedule'
-          ? Boolean(schedule.saveToGoogleDrive ?? true)
+          ? Boolean(scheduleRef.current.saveToGoogleDrive ?? true)
           : saveManualToDrive;
 
       // If Client API Key (PLTS) is missing, but Google Drive upload is requested (e.g. PLTA-only or Drive snapshot mode):
-      if (!credentials.domain || !credentials.pltsKey) {
+      if (!activeCreds.domain || !activeCreds.pltsKey) {
         if (shouldUploadToDrive) {
           const snapshotBackup =
             targetSrv.backups[0] ||
@@ -566,11 +579,12 @@ export function App() {
               srvIdx + 1,
               triggerMode,
               new Date().toISOString(),
-              schedule.lockNewBackups
+              scheduleRef.current.lockNewBackups
             );
           setServers((prev) =>
             prev.map((s) =>
-              s.id === serverId && !s.backups.some((b) => b.id === snapshotBackup.id)
+              (s.id === canonicalServerId || s.identifier === targetSrv.identifier) &&
+              !s.backups.some((b) => b.id === snapshotBackup.id)
                 ? { ...s, backups: [snapshotBackup, ...s.backups] }
                 : s
             )
@@ -610,15 +624,15 @@ export function App() {
           ? schedule.retentionCount || 1
           : targetSrv.limits.backupLimit || 5;
 
-      setBackingUpIds((prev) => [...prev, serverId]);
+      setBackingUpIds((prev) => [...prev, canonicalServerId]);
       try {
         const { ok, data } = await callPteroApi('backup/create', {
-          domain: credentials.domain,
-          pltsKey: credentials.pltsKey,
+          domain: activeCreds.domain,
+          pltsKey: activeCreds.pltsKey,
           serverIdentifier: targetSrv.identifier,
           serverOrdinal: srvIdx + 1,
           serverName: targetSrv.name,
-          isLocked: schedule.lockNewBackups,
+          isLocked: scheduleRef.current.lockNewBackups,
           autoDeletePrevious: shouldAutoDeletePrevious,
           autoDeleteStrategy: effectiveDeleteStrategy,
           retentionCount: effectiveRetentionCount,
@@ -638,7 +652,7 @@ export function App() {
                 srvIdx + 1,
                 triggerMode,
                 new Date().toISOString(),
-                schedule.lockNewBackups
+                scheduleRef.current.lockNewBackups
               );
             const uploadedOk = await handleUploadBackupToDrive(
               fallbackBkp,
@@ -654,7 +668,7 @@ export function App() {
 
         let newBackup: PteroBackupFile = {
           ...data.backup,
-          serverId: targetSrv.id,
+          serverId: canonicalServerId,
           serverName: targetSrv.name,
           serverIdentifier: targetSrv.identifier,
           triggerType: triggerMode,
@@ -669,11 +683,15 @@ export function App() {
 
         setServers((prev) =>
           prev.map((s) => {
-            if (s.id !== serverId) return s;
+            if (s.id !== canonicalServerId && s.identifier !== targetSrv.identifier) return s;
 
             const deletedSet = new Set(deletedUuidsFromServer);
             const afterServerDeletes = s.backups.filter(
-              (b) => !deletedSet.has(b.uuid) && !deletedSet.has(b.id)
+              (b) =>
+                !deletedSet.has(b.uuid) &&
+                !deletedSet.has(b.id) &&
+                b.uuid !== newBackup.uuid &&
+                b.id !== newBackup.id
             );
 
             const { backupsToKeep } = selectBackupsToAutoDelete(afterServerDeletes, {
@@ -706,14 +724,14 @@ export function App() {
             'info'
           );
           newBackup = await waitForPteroBackupCompletion({
-            domain: credentials.domain,
-            pltsKey: credentials.pltsKey,
+            domain: activeCreds.domain,
+            pltsKey: activeCreds.pltsKey,
             backup: newBackup,
           });
 
           setServers((prev) =>
             prev.map((s) => {
-              if (s.id !== serverId) return s;
+              if (s.id !== canonicalServerId && s.identifier !== targetSrv.identifier) return s;
               return {
                 ...s,
                 backups: s.backups.map((b) => (b.id === newBackup.id ? newBackup : b)),
@@ -757,7 +775,7 @@ export function App() {
         showNotice(errMsg, 'error');
         return false;
       } finally {
-        setBackingUpIds((prev) => prev.filter((id) => id !== serverId));
+        setBackingUpIds((prev) => prev.filter((id) => id !== canonicalServerId));
       }
     },
     [
@@ -830,6 +848,13 @@ export function App() {
 
   const [isRunningAutoBackup, setIsRunningAutoBackup] = useState<boolean>(false);
   const isRunningScheduleRef = useRef<boolean>(false);
+  const scheduleRef = useRef(schedule);
+  scheduleRef.current = schedule;
+  const serversRef = useRef(servers);
+  serversRef.current = servers;
+  const credentialsRef = useRef(credentials);
+  credentialsRef.current = credentials;
+  const hasHydratedFromDaemonRef = useRef<boolean>(false);
 
   /**
    * Executes scheduled Auto-Update backup cycle across target servers (including Google Drive upload)
@@ -853,18 +878,29 @@ export function App() {
         nextRunAt: nextScheduledIso,
       }));
 
+      appendLog(
+        'Menjalankan Siklus Auto-Backup Terjadwal',
+        activeSched.targetScope === 'all'
+          ? 'Semua Server'
+          : `${activeSched.selectedServerIds.length || 'Semua'} Server`,
+        'Waktu hitung mundur Auto-Backup tercapai. Memulai pembuatan backup otomatis...',
+        'info'
+      );
+
       try {
-        let activeServers = servers;
+        let activeServers = serversRef.current;
+        const activeCreds = credentialsRef.current;
 
         // If servers list is empty but user has entered Pterodactyl credentials, sync servers automatically first!
         if (
           activeServers.length === 0 &&
-          credentials.domain &&
-          (credentials.pltaKey || credentials.pltsKey)
+          activeCreds.domain &&
+          (activeCreds.pltaKey || activeCreds.pltsKey)
         ) {
-          const syncRes = await callPteroApi('sync', credentials as any);
+          const syncRes = await callPteroApi('sync', activeCreds as any);
           if (syncRes.ok && Array.isArray(syncRes.data?.servers) && syncRes.data.servers.length > 0) {
             activeServers = syncRes.data.servers;
+            serversRef.current = activeServers;
             setServers(activeServers);
           }
         }
@@ -882,17 +918,12 @@ export function App() {
           return;
         }
 
-        const targetIds =
-          activeSched.targetScope === 'all'
-            ? activeServers.map((s) => s.id)
-            : activeSched.selectedServerIds.length > 0
-            ? activeSched.selectedServerIds
-            : activeServers.map((s) => s.id);
+        const targetServers = resolveTargetServersForSchedule(activeServers, activeSched);
 
         let successCount = 0;
-        for (const id of targetIds) {
+        for (const targetSrv of targetServers) {
           const ok = await handleBackupSingleServer(
-            id,
+            targetSrv.id,
             'auto_schedule',
             shouldUploadDrive,
             activeServers
@@ -911,7 +942,7 @@ export function App() {
         if (successCount > 0) {
           showNotice(
             `Siklus Auto-Update selesai: ${successCount} server berhasil di-backup${
-              shouldUploadDrive ? ' dan langsung masuk ke Google Drive Anda' : ' ke panel'
+              shouldUploadDrive ? ' dan langsung diproses ke Google Drive Anda' : ' ke panel'
             }! Jadwal berikutnya: ${new Date(updatedNextRunAt).toLocaleTimeString('id-ID')}.`,
             'success'
           );
@@ -921,17 +952,15 @@ export function App() {
         setIsRunningAutoBackup(false);
       }
     },
-    [servers, credentials, handleBackupSingleServer, handleVerifyDriveBackupNow, showNotice]
+    [handleBackupSingleServer, handleVerifyDriveBackupNow, appendLog, showNotice]
   );
 
-  // Real background timer using Web Worker (immune to browser background tab throttling)
-  const scheduleRef = useRef(schedule);
-  scheduleRef.current = schedule;
   const triggerScheduleRef = useRef(handleTriggerScheduledRunNow);
   triggerScheduleRef.current = handleTriggerScheduledRunNow;
 
   // Keep 24/7 Server Daemon & Google Apps Script Cloud Cron in sync whenever schedule/credentials change
   useEffect(() => {
+    if (!hasHydratedFromDaemonRef.current) return;
     syncAutoBackupDaemon({
       schedule,
       credentials,
@@ -947,7 +976,57 @@ export function App() {
 
     const pullDaemonUpdates = async () => {
       const status = await fetchAutoBackupDaemonStatus();
-      if (!mounted || !status) return;
+      if (!mounted) return;
+
+      if (!status) {
+        hasHydratedFromDaemonRef.current = true;
+        return;
+      }
+
+      // Hydrate credentials & schedule from server daemon if browser localStorage was empty/default
+      if (
+        !hasHydratedFromDaemonRef.current &&
+        status.credentials?.domain &&
+        !credentialsRef.current.domain
+      ) {
+        const hydratedCreds: PteroCredentials = {
+          domain: status.credentials.domain || '',
+          pltaKey: status.credentials.pltaKey || '',
+          pltsKey: status.credentials.pltsKey || '',
+        };
+        credentialsRef.current = hydratedCreds;
+        setCredentials(hydratedCreds);
+        handleSyncFromRealPanel(hydratedCreds).catch(() => {});
+      }
+
+      // Hydrate Google Drive Bridge from server daemon if not connected yet
+      if (status.driveConfig?.appsScriptUrl) {
+        connectWithAppsScriptBridge(
+          status.driveConfig.appsScriptUrl,
+          status.driveConfig.targetFolderId || ''
+        )
+          .then((res) => {
+            if (mounted) {
+              setGoogleUser(res.user);
+              setGoogleToken(res.accessToken);
+            }
+          })
+          .catch(() => {});
+      }
+
+      if (!hasHydratedFromDaemonRef.current && status.schedule) {
+        const aligned = ensureFutureNextRunAt(status.schedule, new Date());
+        const hydratedSched: AutoBackupSchedule = {
+          ...INITIAL_SCHEDULE,
+          ...status.schedule,
+          enabled: Boolean(status.schedule.enabled || scheduleRef.current.enabled),
+          nextRunAt: aligned.nextRunAt,
+        };
+        scheduleRef.current = hydratedSched;
+        setSchedule(hydratedSched);
+      }
+
+      hasHydratedFromDaemonRef.current = true;
 
       if (status.lastCronRunAt) {
         setSchedule((prev) => {
@@ -1040,24 +1119,10 @@ export function App() {
         }
       }
 
-      // If a scheduled cycle expired while the user had the panel closed and neither daemon nor cron ran it yet, catch up now!
+      // If a scheduled cycle expired while the user had the panel closed, run it immediately!
       if (missedOfflineCycleRef.current && scheduleRef.current.enabled && !isRunningScheduleRef.current) {
         missedOfflineCycleRef.current = false;
-        const lastRunMs = scheduleRef.current.lastRunAt
-          ? new Date(scheduleRef.current.lastRunAt).getTime()
-          : 0;
-        const daemonLastMs = status.schedule?.lastRunAt
-          ? new Date(status.schedule.lastRunAt).getTime()
-          : 0;
-        const cronLastMs = status.lastCronRunAt ? new Date(status.lastCronRunAt).getTime() : 0;
-        const mostRecentRunMs = Math.max(lastRunMs, daemonLastMs, cronLastMs);
-        const intervalMs = Math.max(
-          60 * 1000,
-          Math.round((Number(scheduleRef.current.intervalHours) || 1) * 3600 * 1000)
-        );
-        if (Date.now() - mostRecentRunMs >= intervalMs) {
-          triggerScheduleRef.current();
-        }
+        triggerScheduleRef.current();
       }
     };
 
@@ -1067,29 +1132,30 @@ export function App() {
       mounted = false;
       clearInterval(pollInterval);
     };
-  }, []);
+  }, [handleSyncFromRealPanel]);
 
   useEffect(() => {
     const stopWorker = createBackgroundTimerWorker(() => {
       const cur = scheduleRef.current;
       const now = new Date();
-      const nextMs = new Date(cur.nextRunAt).getTime();
 
+      if (shouldTriggerScheduledAutoBackup(cur, now.getTime(), isRunningScheduleRef.current)) {
+        triggerScheduleRef.current();
+        return;
+      }
+
+      const nextMs = new Date(cur.nextRunAt).getTime();
       if (!Number.isFinite(nextMs) || now.getTime() >= nextMs) {
-        if (cur.enabled && !isRunningScheduleRef.current) {
-          triggerScheduleRef.current();
-        } else {
-          // Even if disabled or currently running, roll nextRunAt into the future so timer never sticks at 00:00:00
-          const aligned = ensureFutureNextRunAt(cur, now);
-          if (aligned.nextRunAt !== cur.nextRunAt) {
-            setSchedule((prev) => ({
-              ...prev,
-              nextRunAt: aligned.nextRunAt,
-            }));
-          }
+        // Even if disabled or currently running, roll nextRunAt into the future so timer never sticks at 00:00:00
+        const aligned = ensureFutureNextRunAt(cur, now);
+        if (aligned.nextRunAt !== cur.nextRunAt) {
+          setSchedule((prev) => ({
+            ...prev,
+            nextRunAt: aligned.nextRunAt,
+          }));
         }
       }
-    }, 2000);
+    }, 1000);
 
     return () => stopWorker();
   }, []);
@@ -2021,6 +2087,7 @@ export function App() {
               schedule={schedule}
               servers={servers}
               isDriveConnected={isDriveConnected}
+              isRunningAutoBackup={isRunningAutoBackup}
               onRequestGoogleSignIn={handleGoogleLogin}
               onUpdateSchedule={(updated) => {
                 setSchedule(updated);

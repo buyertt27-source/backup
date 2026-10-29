@@ -153,7 +153,7 @@ export async function uploadBackupToGoogleDrive(params: {
               driveWebViewLink:
                 proxyData.webViewLink || `https://drive.google.com/file/d/${proxyData.driveFileId}/view`,
               driveFolderName: proxyData.folderName || `PteroVault_Backups/${serverFolderName}`,
-              updatedSizeBytes: proxyData.sizeBytes || backup.sizeBytes,
+              updatedSizeBytes: Math.max(Number(proxyData.sizeBytes) || 0, backup.sizeBytes || 0),
               updatedStatus: proxyData.status || backup.status,
             };
           }
@@ -225,7 +225,7 @@ export async function uploadBackupToGoogleDrive(params: {
           ? `https://drive.google.com/drive/folders/${targetFolderId}`
           : 'https://drive.google.com/drive/my-drive'),
       driveFolderName: bridgeData?.folderName || `PteroVault_Backups/${serverFolderName}`,
-      updatedSizeBytes: bridgeData?.sizeBytes || backup.sizeBytes,
+      updatedSizeBytes: Math.max(Number(bridgeData?.sizeBytes) || 0, backup.sizeBytes || 0),
       updatedStatus: 'completed',
     };
   }

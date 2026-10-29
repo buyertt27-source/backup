@@ -10,6 +10,9 @@ import {
   selectBackupsToAutoDelete,
   extractDriveFolderId,
   validateAppsScriptUrl,
+  ensureFutureNextRunAt,
+  shouldTriggerScheduledAutoBackup,
+  resolveTargetServersForSchedule,
 } from './backupLogic';
 import { buildServerDriveFolderName } from '../services/googleDriveService';
 import { PteroServer, PteroBackupFile } from '../types/pterodactyl';
@@ -167,10 +170,6 @@ test('selectBackupsToAutoDelete frees full slots before creation and deletes pre
     },
   ];
 
-  // When serverBackupLimit is 3 (currently 3 backups = FULL) and strategy is delete_all_previous:
-  // 1 oldest unlocked backup ('bkp-oldest') must be deleted BEFORE creating the new backup,
-  // 1 remaining unlocked backup ('bkp-newest') is deleted AFTER creating the new backup,
-  // and locked backup ('bkp-locked') is preserved.
   const planAll = selectBackupsToAutoDelete(existing, {
     autoDeletePrevious: true,
     strategy: 'delete_all_previous',
@@ -232,4 +231,86 @@ test('validateAppsScriptUrl validates Google Apps Script Web App URLs', () => {
   const invalid = validateAppsScriptUrl('https://example.com/webhook');
   assert.equal(invalid.valid, false);
 });
+
+test('ensureFutureNextRunAt rolls past or stuck timestamps forward into the future', () => {
+  const now = new Date('2026-10-27T12:00:00.000Z');
+  const pastIso = '2026-10-27T08:30:00.000Z';
+  const rolled = ensureFutureNextRunAt(
+    {
+      frequency: 'interval_hours',
+      intervalHours: 1,
+      timeOfDay: '03:00',
+      dayOfWeek: 1,
+      nextRunAt: pastIso,
+    },
+    now
+  );
+  assert.equal(rolled.wasDue, true);
+  assert.ok(rolled.missedCycles >= 3);
+  assert.equal(rolled.nextRunAt, '2026-10-27T12:30:00.000Z');
+  assert.ok(new Date(rolled.nextRunAt).getTime() > now.getTime());
+});
+
+test('shouldTriggerScheduledAutoBackup triggers only when enabled, not running, and due', () => {
+  const nowMs = new Date('2026-10-27T12:00:00.000Z').getTime();
+  assert.equal(
+    shouldTriggerScheduledAutoBackup(
+      { enabled: true, nextRunAt: '2026-10-27T11:59:59.000Z' },
+      nowMs,
+      false
+    ),
+    true
+  );
+  assert.equal(
+    shouldTriggerScheduledAutoBackup(
+      { enabled: false, nextRunAt: '2026-10-27T11:59:59.000Z' },
+      nowMs,
+      false
+    ),
+    false
+  );
+  assert.equal(
+    shouldTriggerScheduledAutoBackup(
+      { enabled: true, nextRunAt: '2026-10-27T11:59:59.000Z' },
+      nowMs,
+      true
+    ),
+    false
+  );
+  assert.equal(
+    shouldTriggerScheduledAutoBackup(
+      { enabled: true, nextRunAt: '2026-10-27T12:05:00.000Z' },
+      nowMs,
+      false
+    ),
+    false
+  );
+});
+
+test('resolveTargetServersForSchedule matches by id, uuid, or identifier and falls back to all servers if stale', () => {
+  // Match by UUID even when server.id is 'srv-2'
+  const byUuid = resolveTargetServersForSchedule(sampleServers, {
+    targetScope: 'selected',
+    selectedServerIds: ['22222222-aaaa-bbbb-cccc-000000000002'],
+  });
+  assert.equal(byUuid.length, 1);
+  assert.equal(byUuid[0].identifier, 'e5f6g7h8');
+
+  // Match by short identifier
+  const byIdentifier = resolveTargetServersForSchedule(sampleServers, {
+    targetScope: 'selected',
+    selectedServerIds: ['a1b2c3d4'],
+  });
+  assert.equal(byIdentifier.length, 1);
+  assert.equal(byIdentifier[0].id, 'srv-1');
+
+  // Fallback to all servers when selectedServerIds has stale/non-matching ID
+  const fallbackAll = resolveTargetServersForSchedule(sampleServers, {
+    targetScope: 'selected',
+    selectedServerIds: ['stale-nonexistent-uuid'],
+  });
+  assert.equal(fallbackAll.length, 2);
+});
+
+
 

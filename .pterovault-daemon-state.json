@@ -1,0 +1,29 @@
+{
+  "schedule": {
+    "enabled": true,
+    "frequency": "interval_hours",
+    "intervalHours": 0.0167,
+    "timeOfDay": "03:00",
+    "dayOfWeek": 1,
+    "targetScope": "all",
+    "selectedServerIds": [],
+    "retentionCount": 1,
+    "autoDeletePrevious": true,
+    "autoDeleteStrategy": "delete_all_previous",
+    "lockNewBackups": false,
+    "saveToGoogleDrive": true,
+    "lastRunAt": "2026-10-29T06:00:21.917Z",
+    "nextRunAt": "2026-10-29T06:01:21.659Z"
+  },
+  "credentials": {
+    "domain": "https://samdevmc.rikibotz.web.id",
+    "pltaKey": "ptla_45J81V7S712C6rSZcdYEMujab9sH27AH4zAb1Xy5JV2",
+    "pltsKey": "ptlc_Dex9H4dXge3hemXvwluQJ9bIm48SXAgncMAjalJvrHL"
+  },
+  "driveConfig": {
+    "appsScriptUrl": "https://script.google.com/macros/s/AKfycbxM6RfmAEpfs-R2Tq_ocGxhLriMT6u-7AUkcyEu52CDjYjFP0xk5Dpbk0nDIBPadul-Ww/exec",
+    "targetFolderId": "",
+    "googleAccessToken": "BRIDGE::https://script.google.com/macros/s/AKfycbxM6RfmAEpfs-R2Tq_ocGxhLriMT6u-7AUkcyEu52CDjYjFP0xk5Dpbk0nDIBPadul-Ww/exec::"
+  },
+  "recentBackgroundRuns": []
+}

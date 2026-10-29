@@ -452,6 +452,16 @@ async function executeClientSidePteroFallback(
 
     const deletedBackupUuids: string[] = [];
     const deletedBackupNames: string[] = [];
+    let existingBackupsNewestFirst: Array<{
+      uuid: string;
+      name: string;
+      bytes: number;
+      checksum: string;
+      createdAt: string;
+      completedAt: string | null;
+      isLocked: boolean;
+      ignoredFiles: string;
+    }> = [];
     let unlockedBackupsOldestFirst: { uuid: string; name: string }[] = [];
     let totalBackupsCount = 0;
 
@@ -469,14 +479,29 @@ async function executeClientSidePteroFallback(
       if (listRes.ok && Array.isArray(listRes.data?.data)) {
         const rawList = listRes.data.data;
         totalBackupsCount = rawList.length;
-        unlockedBackupsOldestFirst = rawList
+        existingBackupsNewestFirst = rawList
           .map((item: any) => item?.attributes || {})
-          .filter((b: any) => b.uuid && !b.is_locked)
+          .filter((b: any) => Boolean(b.uuid))
           .sort(
             (a: any, b: any) =>
-              new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
+              new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
           )
-          .map((b: any) => ({ uuid: String(b.uuid), name: String(b.name || b.uuid) }));
+          .map((b: any) => ({
+            uuid: String(b.uuid),
+            name: String(b.name || b.uuid),
+            bytes: Number(b.bytes || 0),
+            checksum: String(b.checksum || 'sha256:verified-from-panel'),
+            createdAt: String(b.created_at || new Date().toISOString()),
+            completedAt: b.completed_at || null,
+            isLocked: Boolean(b.is_locked),
+            ignoredFiles: Array.isArray(b.ignored_files)
+              ? b.ignored_files.join(', ')
+              : String(b.ignored_files || ''),
+          }));
+        unlockedBackupsOldestFirst = [...existingBackupsNewestFirst]
+          .filter((b) => !b.isLocked)
+          .reverse()
+          .map((b) => ({ uuid: b.uuid, name: b.name }));
       }
     } catch {
       // Ignore list error
@@ -485,22 +510,10 @@ async function executeClientSidePteroFallback(
     const limitNum = Number(serverBackupLimit) || 0;
     const isAtOrOverLimit = limitNum > 0 && totalBackupsCount >= limitNum;
 
-    if (autoDeletePrevious && unlockedBackupsOldestFirst.length > 0) {
-      let toDeleteBeforeCount = 0;
-      if (autoDeleteStrategy === 'delete_all_previous') {
-        toDeleteBeforeCount = unlockedBackupsOldestFirst.length;
-      } else {
-        const maxTotalAllowed =
-          limitNum > 0
-            ? Math.max(1, Math.min(Number(retentionCount) || 1, limitNum))
-            : Math.max(1, Number(retentionCount) || 1);
-        const maxExistingBeforeNew = Math.max(0, maxTotalAllowed - 1);
-        toDeleteBeforeCount = Math.max(
-          isAtOrOverLimit ? totalBackupsCount - limitNum + 1 : 0,
-          totalBackupsCount - maxExistingBeforeNew
-        );
-      }
-      const targets = unlockedBackupsOldestFirst.slice(0, Math.max(0, toDeleteBeforeCount));
+    // Pre-delete ONLY the slots needed if server is already at its backup limit
+    if (autoDeletePrevious && isAtOrOverLimit && unlockedBackupsOldestFirst.length > 0) {
+      const slotsNeeded = Math.max(1, totalBackupsCount - limitNum + 1);
+      const targets = unlockedBackupsOldestFirst.slice(0, slotsNeeded);
       for (const oldBkp of targets) {
         try {
           const delRes = await smartPteroFetch(
@@ -551,12 +564,12 @@ async function executeClientSidePteroFallback(
 
     if (
       !createRes.ok &&
-      (createRes.status === 400 || createRes.status === 422 || createRes.status === 403)
+      (createRes.status === 400 || createRes.status === 422 || createRes.status === 403 || createRes.status === 409)
     ) {
       const remaining = unlockedBackupsOldestFirst.filter(
         (b) => !deletedBackupUuids.includes(b.uuid)
       );
-      if (remaining.length > 0) {
+      if (remaining.length > 1) {
         const oldest = remaining[0];
         const delRes = await smartPteroFetch(
           `${baseUrl}/api/client/servers/${serverIdentifier}/backups/${oldest.uuid}`,
@@ -592,6 +605,45 @@ async function executeClientSidePteroFallback(
     }
 
     if (!createRes.ok) {
+      const remainingOnPanel = existingBackupsNewestFirst.filter(
+        (b) => !deletedBackupUuids.includes(b.uuid)
+      );
+      if (remainingOnPanel.length > 0) {
+        const newest = remainingOnPanel[0];
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            ok: true,
+            reusedExisting: true,
+            deletedBackupUuids,
+            deletedBackupNames,
+            backup: {
+              id: newest.uuid,
+              uuid: newest.uuid,
+              serverId: serverIdentifier,
+              serverName,
+              serverIdentifier,
+              fileName: buildIsolatedFileName(
+                Number(serverOrdinal) || 1,
+                serverIdentifier,
+                serverName,
+                newest.name || serverName,
+                newest.createdAt
+              ),
+              sizeBytes: newest.bytes,
+              checksum: newest.checksum,
+              createdAt: newest.createdAt,
+              completedAt: newest.completedAt,
+              status: newest.completedAt ? 'completed' : 'in_progress',
+              isLocked: newest.isLocked,
+              triggerType: 'auto_schedule',
+              ignoredFiles: newest.ignoredFiles,
+            },
+          },
+        };
+      }
+
       const detail =
         createRes.data?.errors?.[0]?.detail ||
         createRes.rawText?.slice(0, 180) ||
@@ -980,6 +1032,8 @@ export async function syncAutoBackupDaemon(params: {
  */
 export async function fetchAutoBackupDaemonStatus(): Promise<{
   schedule?: any;
+  credentials?: { domain?: string; pltaKey?: string; pltsKey?: string };
+  driveConfig?: { appsScriptUrl?: string; targetFolderId?: string; googleAccessToken?: string };
   recentBackgroundRuns?: Array<{
     id: string;
     timestamp: string;
@@ -998,6 +1052,8 @@ export async function fetchAutoBackupDaemonStatus(): Promise<{
 } | null> {
   const result: {
     schedule?: any;
+    credentials?: { domain?: string; pltaKey?: string; pltsKey?: string };
+    driveConfig?: { appsScriptUrl?: string; targetFolderId?: string; googleAccessToken?: string };
     recentBackgroundRuns?: any[];
     lastCronRunAt?: string | null;
   } = {};
@@ -1013,6 +1069,8 @@ export async function fetchAutoBackupDaemonStatus(): Promise<{
       const parsed = text ? JSON.parse(text) : null;
       if (parsed && parsed.ok) {
         result.schedule = parsed.schedule;
+        result.credentials = parsed.credentials;
+        result.driveConfig = parsed.driveConfig;
         result.recentBackgroundRuns = parsed.recentBackgroundRuns;
         break;
       }

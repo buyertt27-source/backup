@@ -47,6 +47,7 @@ const DAYS_OF_WEEK = [
 ];
 
 const INTERVAL_OPTIONS = [
+  { value: 0.0167, label: 'Setiap 1 Menit (Tes Cepat Auto-Backup)' },
   { value: 0.0833, label: 'Setiap 5 Menit (Tes Cepat ke Drive)' },
   { value: 0.25, label: 'Setiap 15 Menit' },
   { value: 0.5, label: 'Setiap 30 Menit' },
@@ -166,9 +167,12 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
   };
 
   const handleToggleServerInSchedule = (srvId: string) => {
-    setSelectedServerIds((prev) =>
-      prev.includes(srvId) ? prev.filter((id) => id !== srvId) : [...prev, srvId]
-    );
+    setSelectedServerIds((prev) => {
+      const nextIds = prev.includes(srvId) ? prev.filter((id) => id !== srvId) : [...prev, srvId];
+      setEnabled(true);
+      onUpdateSchedule(buildScheduleObject({ enabled: true, selectedServerIds: nextIds }));
+      return nextIds;
+    });
   };
 
   const handleQuickToggleEnabled = () => {
@@ -183,15 +187,15 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
     }
     onUpdateSchedule(updated);
 
-    if (nextEnabled && runImmediatelyOnSave) {
+    if (nextEnabled && runImmediatelyOnSave && (servers.length > 0 || isDriveConnected)) {
       onTriggerScheduledRunNow(updated);
       setSaveFeedback(
-        'Auto-Backup diaktifkan! Menjalankan siklus backup pertama sekarang dan mengunggah ke Google Drive...'
+        'Auto-Backup 24/7 diaktifkan! Menjalankan siklus backup pertama sekarang dan menyinkronkan Background Daemon...'
       );
     } else {
       setSaveFeedback(
         nextEnabled
-          ? `Auto-Backup diaktifkan! Eksekusi berikutnya: ${new Date(updated.nextRunAt).toLocaleString('id-ID')}`
+          ? `Auto-Backup 24/7 diaktifkan (Background Daemon & Cloud Cron siap berjalan walau panel ditutup)! Eksekusi berikutnya: ${new Date(updated.nextRunAt).toLocaleString('id-ID')}`
           : 'Auto-Backup dinonaktifkan.'
       );
     }
@@ -347,7 +351,20 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold uppercase tracking-wider">
-                {enabled ? 'Timer Auto-Backup Aktif' : 'Timer Auto-Backup Belum Aktif'}
+                {enabled ? 'Timer Auto-Backup 24/7 Aktif' : 'Timer Auto-Backup Belum Aktif'}
+              </span>
+              <span
+                className={`px-2 py-0.5 text-[11px] rounded font-medium ${
+                  enabled
+                    ? isDark
+                      ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/60'
+                      : 'bg-emerald-100 text-emerald-800'
+                    : isDark
+                    ? 'bg-zinc-900 text-zinc-400 border border-zinc-800'
+                    : 'bg-slate-200 text-slate-700'
+                }`}
+              >
+                Daemon 24/7 (Jalan Walau Panel Ditutup)
               </span>
               <span
                 className={`px-2 py-0.5 text-[11px] rounded font-medium ${
@@ -371,8 +388,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               {schedule.lastRunAt
                 ? `Backup otomatis terakhir berhasil dijalankan pada: ${new Date(
                     schedule.lastRunAt
-                  ).toLocaleString('id-ID')}`
-                : 'Klik "Simpan & Aktifkan Auto-Backup" atau "Jalankan Auto-Backup ke Drive Sekarang" untuk memulai siklus pertama.'}
+                  ).toLocaleString('id-ID')} · Berjalan otomatis di background tanpa harus membuka panel.`
+                : 'Sistem menjalankan Auto-Backup 24/7 via Server Daemon & Google Apps Script Cloud Cron bahkan saat browser ditutup.'}
             </p>
           </div>
         </div>
@@ -387,7 +404,7 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               Hitung Mundur Backup Berikutnya
             </div>
             <div className="text-base font-bold tracking-wider">
-              {enabled ? countdownText : '--:--:--'}
+              {isRunningAutoBackup ? 'MEMPROSES...' : enabled ? countdownText : '--:--:--'}
             </div>
           </div>
 
@@ -419,9 +436,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
               onChange={(e) => {
                 const nextFreq = e.target.value as ScheduleFrequency;
                 setFrequency(nextFreq);
-                if (enabled) {
-                  onUpdateSchedule(buildScheduleObject({ frequency: nextFreq }));
-                }
+                setEnabled(true);
+                onUpdateSchedule(buildScheduleObject({ enabled: true, frequency: nextFreq }));
               }}
               className={`w-full px-3.5 py-2.5 text-sm rounded-lg border transition-colors ${
                 isDark
@@ -447,9 +463,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 onChange={(e) => {
                   const val = Number(e.target.value);
                   setIntervalHours(val);
-                  if (enabled) {
-                    onUpdateSchedule(buildScheduleObject({ intervalHours: val }));
-                  }
+                  setEnabled(true);
+                  onUpdateSchedule(buildScheduleObject({ enabled: true, intervalHours: val }));
                 }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
                   isDark
@@ -482,9 +497,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                   onChange={(e) => {
                     const val = e.target.value;
                     setTimeOfDay(val);
-                    if (enabled) {
-                      onUpdateSchedule(buildScheduleObject({ timeOfDay: val }));
-                    }
+                    setEnabled(true);
+                    onUpdateSchedule(buildScheduleObject({ enabled: true, timeOfDay: val }));
                   }}
                   className={`w-full pl-10 pr-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
                     isDark
@@ -508,9 +522,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 onChange={(e) => {
                   const val = Number(e.target.value);
                   setDayOfWeek(val);
-                  if (enabled) {
-                    onUpdateSchedule(buildScheduleObject({ dayOfWeek: val }));
-                  }
+                  setEnabled(true);
+                  onUpdateSchedule(buildScheduleObject({ enabled: true, dayOfWeek: val }));
                 }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border transition-colors ${
                   isDark
@@ -539,14 +552,14 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                     val === 1 ? 'delete_all_previous' : 'keep_retention_count';
                   setRetentionCount(val);
                   setAutoDeleteStrategy(nextStrat);
-                  if (enabled) {
-                    onUpdateSchedule(
-                      buildScheduleObject({
-                        retentionCount: val,
-                        autoDeleteStrategy: nextStrat,
-                      })
-                    );
-                  }
+                  setEnabled(true);
+                  onUpdateSchedule(
+                    buildScheduleObject({
+                      enabled: true,
+                      retentionCount: val,
+                      autoDeleteStrategy: nextStrat,
+                    })
+                  );
                 }}
                 className={`w-full px-3.5 py-2.5 text-sm rounded-lg border font-mono tabular-nums transition-colors ${
                   isDark
@@ -812,9 +825,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 type="button"
                 onClick={() => {
                   setTargetScope('all');
-                  if (enabled) {
-                    onUpdateSchedule(buildScheduleObject({ targetScope: 'all' }));
-                  }
+                  setEnabled(true);
+                  onUpdateSchedule(buildScheduleObject({ enabled: true, targetScope: 'all' }));
                 }}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   targetScope === 'all'
@@ -832,9 +844,8 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 type="button"
                 onClick={() => {
                   setTargetScope('selected');
-                  if (enabled) {
-                    onUpdateSchedule(buildScheduleObject({ targetScope: 'selected' }));
-                  }
+                  setEnabled(true);
+                  onUpdateSchedule(buildScheduleObject({ enabled: true, targetScope: 'selected' }));
                 }}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
                   targetScope === 'selected'
@@ -859,7 +870,10 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
                 </p>
               ) : (
                 servers.map((srv, idx) => {
-                  const checked = selectedServerIds.includes(srv.id);
+                  const checked =
+                    selectedServerIds.includes(srv.id) ||
+                    selectedServerIds.includes(srv.uuid) ||
+                    selectedServerIds.includes(srv.identifier);
                   return (
                     <button
                       key={srv.id}
@@ -928,7 +942,7 @@ export const AutoBackupSchedulerPanel: React.FC<AutoBackupSchedulerPanelProps> =
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
               <CalendarCheck className={`w-4 h-4 shrink-0 ${isDark ? 'text-red-400' : 'text-blue-600'}`} />
               Jadwal Berikutnya:{' '}
-              {new Date(schedule.nextRunAt).toLocaleString('id-ID', {
+              {new Date(alignedSchedule.nextRunAt).toLocaleString('id-ID', {
                 day: '2-digit',
                 month: 'short',
                 year: 'numeric',

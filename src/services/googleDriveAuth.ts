@@ -538,6 +538,11 @@ export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessTok
       authMethod: 'firebase',
     };
     cachedUser = mappedUser;
+    saveDriveAuthConfig({
+      ...getSavedDriveAuthConfig(),
+      directAccessToken: cachedAccessToken,
+      connectedEmail: mappedUser.email || undefined,
+    });
     return { user: mappedUser, accessToken: cachedAccessToken };
   } catch (error: any) {
     const errCode = String(error?.code || '');
@@ -562,11 +567,6 @@ export const googleSignIn = async (): Promise<{ user: GoogleDriveUser; accessTok
       }
     }
 
-    if (errCode === 'auth/popup-blocked') {
-      await signInWithRedirect(auth, provider);
-      return null;
-    }
-
     console.error('Google Sign-In error:', error);
     throw error;
   } finally {
@@ -581,7 +581,7 @@ export const getAccessToken = async (): Promise<string | null> => {
     return `BRIDGE::${savedCfg.appsScriptUrl}::${savedCfg.targetFolderId || ''}`;
   }
 
-  if (cachedAccessToken && Date.now() < cachedTokenExpiryMs - 60000) {
+  if (cachedAccessToken && Date.now() < cachedTokenExpiryMs - 30000) {
     return cachedAccessToken;
   }
 
@@ -594,6 +594,10 @@ export const getAccessToken = async (): Promise<string | null> => {
     } catch (err) {
       console.error('Auto-refresh Google token failed:', err);
     }
+  }
+
+  if (savedCfg.directAccessToken) {
+    return savedCfg.directAccessToken;
   }
 
   return cachedAccessToken;

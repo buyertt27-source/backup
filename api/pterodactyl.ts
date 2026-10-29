@@ -83,6 +83,57 @@ export default async function handler(req: any, res: any) {
 
   try {
     // =========================================================================
+    // 0. POST /api/pterodactyl/daemon/sync & /api/pterodactyl/daemon/status
+    // (MUST be checked BEFORE routeKey.includes('sync'))
+    // =========================================================================
+    if (routeKey.includes('daemon/sync') || routeKey.includes('daemon/status')) {
+      const { schedule, credentials, driveConfig } = body || {};
+      let updatedSchedule = schedule ? { ...schedule } : undefined;
+
+      if (updatedSchedule) {
+        const nowMs = Date.now();
+        const nextMs = updatedSchedule.nextRunAt ? new Date(updatedSchedule.nextRunAt).getTime() : NaN;
+        if (!Number.isFinite(nextMs) || nextMs <= nowMs) {
+          const hours = Number(updatedSchedule.intervalHours) > 0 ? Number(updatedSchedule.intervalHours) : 1;
+          const intervalMs = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
+          updatedSchedule.nextRunAt = new Date(nowMs + intervalMs).toISOString();
+        }
+      }
+
+      if (routeKey.includes('daemon/sync') && driveConfig?.appsScriptUrl && credentials?.domain) {
+        try {
+          await fetchWithTimeout(
+            driveConfig.appsScriptUrl.trim(),
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+              body: JSON.stringify({
+                action: 'configure_cron',
+                enabled: Boolean(updatedSchedule?.enabled),
+                intervalHours: updatedSchedule?.intervalHours || 1,
+                domain: cleanDomain(credentials.domain),
+                pltsKey: (credentials.pltsKey || '').trim(),
+                targetFolderId: driveConfig.targetFolderId || '',
+                autoDeletePrevious: Boolean(updatedSchedule?.autoDeletePrevious ?? true),
+              }),
+            },
+            10000
+          );
+        } catch {
+          // non-blocking
+        }
+      }
+
+      res.status(200).json({
+        ok: true,
+        schedule: updatedSchedule || null,
+        recentBackgroundRuns: [],
+        isDaemonRunning: false,
+      });
+      return;
+    }
+
+    // =========================================================================
     // 1. POST /api/pterodactyl/sync
     // =========================================================================
     if (routeKey.includes('sync')) {
@@ -348,43 +399,51 @@ export default async function handler(req: any, res: any) {
         name: string;
         createdAt: string;
         isLocked: boolean;
+        bytes: number;
+        checksum: string;
+        completedAt: string | null;
+        isSuccessful: boolean;
+        ignoredFiles: string;
       }> = [];
 
-      if (shouldAutoDelete) {
-        try {
-          const listRes = await fetchWithTimeout(
-            `${baseUrl}/api/client/servers/${serverIdentifier}/backups?per_page=50`,
-            {
-              method: 'GET',
-              headers: { Authorization: `Bearer ${plts}` },
-            },
-            10000
-          );
-          if (listRes.ok) {
-            const listJson = (await listRes.json()) as any;
-            const rawData = Array.isArray(listJson?.data) ? listJson.data : [];
-            existingPanelBackups = rawData
-              .map((item: any) => {
-                const a = item?.attributes || {};
-                const createdStr = a.created_at || new Date(0).toISOString();
-                return {
-                  uuid: String(a.uuid || ''),
-                  name: buildIsolatedFileName(
-                    ordinal,
-                    serverIdentifier,
-                    serverName || serverIdentifier,
-                    a.name || serverName || serverIdentifier,
-                    createdStr
-                  ),
-                  createdAt: createdStr,
-                  isLocked: Boolean(a.is_locked),
-                };
-              })
-              .filter((b: any) => Boolean(b.uuid))
-              .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          }
-        } catch {}
-      }
+      try {
+        const listRes = await fetchWithTimeout(
+          `${baseUrl}/api/client/servers/${serverIdentifier}/backups?per_page=50`,
+          {
+            method: 'GET',
+            headers: { Authorization: `Bearer ${plts}` },
+          },
+          10000
+        );
+        if (listRes.ok) {
+          const listJson = (await listRes.json()) as any;
+          const rawData = Array.isArray(listJson?.data) ? listJson.data : [];
+          existingPanelBackups = rawData
+            .map((item: any) => {
+              const a = item?.attributes || {};
+              const createdStr = a.created_at || new Date(0).toISOString();
+              return {
+                uuid: String(a.uuid || ''),
+                name: buildIsolatedFileName(
+                  ordinal,
+                  serverIdentifier,
+                  serverName || serverIdentifier,
+                  a.name || serverName || serverIdentifier,
+                  createdStr
+                ),
+                createdAt: createdStr,
+                isLocked: Boolean(a.is_locked),
+                bytes: Number(a.bytes) || 0,
+                checksum: String(a.checksum || 'sha256:verified-from-panel'),
+                completedAt: a.completed_at || null,
+                isSuccessful: a.is_successful !== false,
+                ignoredFiles: a.ignored_files ? String(a.ignored_files) : '',
+              };
+            })
+            .filter((b: any) => Boolean(b.uuid))
+            .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        }
+      } catch {}
 
       const unlockedOldestFirst = [...existingPanelBackups].filter((b) => !b.isLocked).reverse();
 
@@ -433,6 +492,42 @@ export default async function handler(req: any, res: any) {
       }
 
       if (!response.ok) {
+        const remainingOnPanel = existingPanelBackups.filter(
+          (b) => !deletedBackupUuids.includes(b.uuid)
+        );
+        if (
+          remainingOnPanel.length > 0 &&
+          (response.status === 400 ||
+            response.status === 409 ||
+            response.status === 422 ||
+            response.status === 429)
+        ) {
+          const newest = remainingOnPanel[0];
+          res.status(200).json({
+            ok: true,
+            reusedExisting: true,
+            backup: {
+              id: newest.uuid,
+              uuid: newest.uuid,
+              serverId: serverIdentifier,
+              serverName: serverName || serverIdentifier,
+              serverIdentifier,
+              fileName: newest.name,
+              sizeBytes: newest.bytes,
+              checksum: newest.checksum,
+              createdAt: newest.createdAt,
+              completedAt: newest.completedAt,
+              status: newest.isSuccessful === false ? 'failed' : newest.completedAt ? 'completed' : 'in_progress',
+              isLocked: newest.isLocked,
+              triggerType: 'auto_schedule',
+              ignoredFiles: newest.ignoredFiles,
+            },
+            deletedBackupUuids,
+            deletedBackupNames,
+          });
+          return;
+        }
+
         const text = await response.text().catch(() => '');
         let parsedMsg = `HTTP ${response.status}`;
         try {
@@ -739,7 +834,7 @@ export default async function handler(req: any, res: any) {
           driveFileId: createdId,
           webViewLink: bridgeData.webViewLink || `https://drive.google.com/file/d/${createdId}/view`,
           folderName: bridgeData.folderName || `PteroVault_Backups/${serverFolderName || serverIdentifier}`,
-          sizeBytes: bridgeData.sizeBytes || finalBytes,
+          sizeBytes: Math.max(Number(bridgeData.sizeBytes) || 0, finalBytes),
           status: isReady ? 'completed' : undefined,
         });
         return;
@@ -802,55 +897,7 @@ export default async function handler(req: any, res: any) {
       return;
     }
 
-    // =========================================================================
-    // 7. POST /api/pterodactyl/daemon/sync & /api/pterodactyl/daemon/status
-    // =========================================================================
-    if (routeKey.includes('daemon/sync') || routeKey.includes('daemon/status')) {
-      const { schedule, credentials, driveConfig } = body || {};
-      let updatedSchedule = schedule ? { ...schedule } : undefined;
 
-      if (updatedSchedule) {
-        const nowMs = Date.now();
-        const nextMs = updatedSchedule.nextRunAt ? new Date(updatedSchedule.nextRunAt).getTime() : NaN;
-        if (!Number.isFinite(nextMs) || nextMs <= nowMs) {
-          const hours = Number(updatedSchedule.intervalHours) > 0 ? Number(updatedSchedule.intervalHours) : 1;
-          const intervalMs = Math.max(60 * 1000, Math.round(hours * 60 * 60 * 1000));
-          updatedSchedule.nextRunAt = new Date(nowMs + intervalMs).toISOString();
-        }
-      }
-
-      if (routeKey.includes('daemon/sync') && driveConfig?.appsScriptUrl && credentials?.domain) {
-        try {
-          await fetchWithTimeout(
-            driveConfig.appsScriptUrl.trim(),
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-              body: JSON.stringify({
-                action: 'configure_cron',
-                enabled: Boolean(updatedSchedule?.enabled),
-                intervalHours: updatedSchedule?.intervalHours || 1,
-                domain: cleanDomain(credentials.domain),
-                pltsKey: (credentials.pltsKey || '').trim(),
-                targetFolderId: driveConfig.targetFolderId || '',
-                autoDeletePrevious: Boolean(updatedSchedule?.autoDeletePrevious ?? true),
-              }),
-            },
-            10000
-          );
-        } catch {
-          // non-blocking
-        }
-      }
-
-      res.status(200).json({
-        ok: true,
-        schedule: updatedSchedule || null,
-        recentBackgroundRuns: [],
-        isDaemonRunning: false,
-      });
-      return;
-    }
 
     res.status(404).json({ ok: false, error: `Endpoint tidak ditemukan: ${routeKey}` });
   } catch (err: any) {

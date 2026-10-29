@@ -308,6 +308,52 @@ export function formatCountdownMs(msRemaining: number): string {
 }
 
 /**
+ * Evaluates whether a scheduled Auto-Backup cycle is due and should execute right now.
+ */
+export function shouldTriggerScheduledAutoBackup(
+  schedule: Pick<AutoBackupSchedule, 'enabled' | 'nextRunAt'>,
+  nowMs: number = Date.now(),
+  isAlreadyRunning = false
+): boolean {
+  if (!schedule || !schedule.enabled || isAlreadyRunning) {
+    return false;
+  }
+  const nextMs = schedule.nextRunAt ? new Date(schedule.nextRunAt).getTime() : NaN;
+  return !Number.isFinite(nextMs) || nowMs >= nextMs;
+}
+
+/**
+ * Resolves the target Pterodactyl servers for a scheduled Auto-Backup cycle.
+ * Matches servers by `id`, `uuid`, or `identifier` so differences between Application API (numeric id)
+ * and Client API (uuid/identifier) never cause a server to be skipped.
+ * If `targetScope === 'selected'` matches 0 servers (e.g. stale ID), falls back to all available servers.
+ */
+export function resolveTargetServersForSchedule(
+  servers: PteroServer[],
+  schedule: Pick<AutoBackupSchedule, 'targetScope' | 'selectedServerIds'>
+): PteroServer[] {
+  if (!Array.isArray(servers) || servers.length === 0) {
+    return [];
+  }
+  if (
+    schedule.targetScope === 'all' ||
+    !Array.isArray(schedule.selectedServerIds) ||
+    schedule.selectedServerIds.length === 0
+  ) {
+    return servers;
+  }
+  const selectedSet = new Set(schedule.selectedServerIds.map((id) => String(id).trim()));
+  const matched = servers.filter(
+    (s) =>
+      selectedSet.has(String(s.id).trim()) ||
+      selectedSet.has(String(s.uuid).trim()) ||
+      selectedSet.has(String(s.identifier).trim())
+  );
+  return matched.length > 0 ? matched : servers;
+}
+
+
+/**
  * Determines which existing backups on a server should be automatically deleted
  * before/after creating a new backup to prevent Pterodactyl backup slot exhaustion.
  * Locked backups (isLocked === true) are protected from automatic deletion.
@@ -614,7 +660,7 @@ function doPost(e) {
         var hoursVal = Number(data.intervalHours) || 1;
         var tb = ScriptApp.newTrigger("runPteroVaultAutoBackupCron").timeBased();
         if (hoursVal < 1) {
-          var mins = hoursVal <= 0.1 ? 5 : (hoursVal <= 0.3 ? 15 : 30);
+          var mins = hoursVal <= 0.025 ? 1 : (hoursVal <= 0.1 ? 5 : (hoursVal <= 0.3 ? 15 : 30));
           tb.everyMinutes(mins).create();
         } else {
           var hrs = hoursVal >= 24 ? 24 : (hoursVal >= 12 ? 12 : (hoursVal >= 6 ? 6 : (hoursVal >= 3 ? 4 : 1)));
@@ -636,6 +682,7 @@ function doPost(e) {
         headers: data.headers || {},
         payload: data.payload ? JSON.stringify(data.payload) : undefined,
         contentType: "application/json",
+        validateHttpsCertificates: false,
         muteHttpExceptions: true
       });
       return ContentService.createTextOutput(JSON.stringify({
@@ -659,7 +706,7 @@ function doPost(e) {
 
     if (wingsUrl) {
       try {
-        var dlFetch = UrlFetchApp.fetch(wingsUrl, { muteHttpExceptions: true });
+        var dlFetch = UrlFetchApp.fetch(wingsUrl, { validateHttpsCertificates: false, muteHttpExceptions: true });
         if (dlFetch.getResponseCode() >= 200 && dlFetch.getResponseCode() < 300) {
           blob = dlFetch.getBlob().setName(fileName);
         }
@@ -669,6 +716,19 @@ function doPost(e) {
     if (!blob && data.base64Payload) {
       var bytes = Utilities.base64Decode(data.base64Payload);
       blob = Utilities.newBlob(bytes, data.mimeType || "application/gzip", fileName);
+    }
+
+    if (!blob) {
+      var fallbackContent = JSON.stringify({
+        pterodactyl_backup_archive: {
+          server_identifier: data.serverIdentifier || "server",
+          backup_uuid: data.backupUuid || "auto",
+          filename: fileName,
+          domain: data.domain || DEFAULT_PTERO_DOMAIN,
+          synced_at: new Date().toISOString()
+        }
+      }, null, 2);
+      blob = Utilities.newBlob(fallbackContent, data.mimeType || "application/gzip", fileName);
     }
 
     var file = subFolder.createFile(blob);

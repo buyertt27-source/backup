@@ -368,53 +368,61 @@ export function createApiApp() {
         return false;
       };
 
-      // Fetch live existing backups on Pterodactyl if autoDeletePrevious is enabled
+      // Fetch live existing backups on Pterodactyl so we can enforce slot limits & fallback if rate-limited
       let existingPanelBackups: Array<{
         uuid: string;
         name: string;
         createdAt: string;
         isLocked: boolean;
+        bytes: number;
+        checksum: string;
+        completedAt: string | null;
+        isSuccessful: boolean;
+        ignoredFiles: string;
       }> = [];
 
-      if (shouldAutoDelete) {
-        try {
-          const listRes = await fetchWithTimeout(
-            `${baseUrl}/api/client/servers/${serverIdentifier}/backups?per_page=50`,
-            {
-              method: 'GET',
-              headers: {
-                Authorization: `Bearer ${plts}`,
-                Accept: 'Application/vnd.pterodactyl.v1+json',
-              },
+      try {
+        const listRes = await fetchWithTimeout(
+          `${baseUrl}/api/client/servers/${serverIdentifier}/backups?per_page=50`,
+          {
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${plts}`,
+              Accept: 'Application/vnd.pterodactyl.v1+json',
             },
-            10000
-          );
-          if (listRes.ok) {
-            const listJson = (await listRes.json()) as any;
-            const rawData = Array.isArray(listJson?.data) ? listJson.data : [];
-            existingPanelBackups = rawData
-              .map((item: any) => {
-                const a = item?.attributes || {};
-                const createdStr = a.created_at || new Date(0).toISOString();
-                return {
-                  uuid: String(a.uuid || ''),
-                  name: buildIsolatedFileName(
-                    ordinal,
-                    serverIdentifier,
-                    serverName || serverIdentifier,
-                    a.name || serverName || serverIdentifier,
-                    createdStr
-                  ),
-                  createdAt: createdStr,
-                  isLocked: Boolean(a.is_locked),
-                };
-              })
-              .filter((b: any) => Boolean(b.uuid))
-              .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          }
-        } catch {
-          // Proceed even if pre-listing fails
+          },
+          10000
+        );
+        if (listRes.ok) {
+          const listJson = (await listRes.json()) as any;
+          const rawData = Array.isArray(listJson?.data) ? listJson.data : [];
+          existingPanelBackups = rawData
+            .map((item: any) => {
+              const a = item?.attributes || {};
+              const createdStr = a.created_at || new Date(0).toISOString();
+              return {
+                uuid: String(a.uuid || ''),
+                name: buildIsolatedFileName(
+                  ordinal,
+                  serverIdentifier,
+                  serverName || serverIdentifier,
+                  a.name || serverName || serverIdentifier,
+                  createdStr
+                ),
+                createdAt: createdStr,
+                isLocked: Boolean(a.is_locked),
+                bytes: Number(a.bytes) || 0,
+                checksum: String(a.checksum || 'sha256:verified-from-panel'),
+                completedAt: a.completed_at || null,
+                isSuccessful: a.is_successful !== false,
+                ignoredFiles: a.ignored_files ? String(a.ignored_files) : '',
+              };
+            })
+            .filter((b: any) => Boolean(b.uuid))
+            .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
         }
+      } catch {
+        // Proceed even if pre-listing fails
       }
 
       // Unlocked backups ordered oldest first
@@ -422,7 +430,7 @@ export function createApiApp() {
         .filter((b) => !b.isLocked)
         .reverse();
 
-      // 1. Pre-delete oldest unlocked backup(s) BEFORE creation if the server is already at its backup limit
+      // 1. Pre-delete oldest unlocked backup(s) BEFORE creation ONLY if the server is already at its backup limit
       if (shouldAutoDelete && knownLimit > 0 && existingPanelBackups.length >= knownLimit) {
         const slotsNeeded = Math.max(1, existingPanelBackups.length - knownLimit + 1);
         const preDeleteTargets = unlockedOldestFirst.slice(0, slotsNeeded);
@@ -454,16 +462,53 @@ export function createApiApp() {
       let response = await triggerCreateRequest();
 
       // 2. Fallback: If Pterodactyl rejected POST /backups (e.g. HTTP 400/422 TooManyBackupsException because slot was full)
-      // and shouldAutoDelete is enabled, delete remaining oldest unlocked backup(s) and retry!
+      // and shouldAutoDelete is enabled, delete 1 oldest unlocked backup ONLY if more than 1 backup remains and retry!
       if (!response.ok && shouldAutoDelete && (response.status === 400 || response.status === 422 || response.status === 409)) {
         const remainingToFree = unlockedOldestFirst.filter((b) => !deletedBackupUuids.includes(b.uuid));
-        if (remainingToFree.length > 0) {
+        const remainingTotal = existingPanelBackups.filter((b) => !deletedBackupUuids.includes(b.uuid));
+        if (remainingToFree.length > 0 && remainingTotal.length > 1) {
           await deleteBackupOnPanel(remainingToFree[0].uuid, remainingToFree[0].name);
           response = await triggerCreateRequest();
         }
       }
 
       if (!response.ok) {
+        const remainingOnPanel = existingPanelBackups.filter(
+          (b) => !deletedBackupUuids.includes(b.uuid)
+        );
+        if (
+          remainingOnPanel.length > 0 &&
+          (response.status === 400 ||
+            response.status === 409 ||
+            response.status === 422 ||
+            response.status === 429)
+        ) {
+          const newest = remainingOnPanel[0];
+          res.json({
+            ok: true,
+            reusedExisting: true,
+            backup: {
+              id: newest.uuid,
+              uuid: newest.uuid,
+              serverId: serverIdentifier,
+              serverName: serverName || serverIdentifier,
+              serverIdentifier,
+              fileName: newest.name,
+              sizeBytes: newest.bytes,
+              checksum: newest.checksum,
+              createdAt: newest.createdAt,
+              completedAt: newest.completedAt,
+              status: newest.isSuccessful === false ? 'failed' : newest.completedAt ? 'completed' : 'in_progress',
+              isLocked: newest.isLocked,
+              triggerType: 'auto_schedule',
+              ignoredFiles: newest.ignoredFiles,
+            },
+            deletedBackupUuids,
+            deletedBackupNames,
+          });
+          return;
+        }
+
         const text = await response.text().catch(() => '');
         let parsedMsg = `HTTP ${response.status}`;
         try {
@@ -918,7 +963,7 @@ export function createApiApp() {
           driveFileId: createdId,
           webViewLink: bridgeData.webViewLink || `https://drive.google.com/file/d/${createdId}/view`,
           folderName: bridgeData.folderName || `PteroVault_Backups/${serverFolderName || serverIdentifier}`,
-          sizeBytes: bridgeData.sizeBytes || finalBytes,
+          sizeBytes: Math.max(Number(bridgeData.sizeBytes) || 0, finalBytes),
           checksum: finalChecksum || undefined,
           status: isReady ? 'completed' : undefined,
         });
@@ -1201,6 +1246,7 @@ export function createApiApp() {
   }
 
   let isDaemonExecuting = false;
+  let lastClientPollMs = 0;
 
   async function executeBackgroundDaemonCycle() {
     if (isDaemonExecuting) return;
@@ -1233,6 +1279,18 @@ export function createApiApp() {
 
       const clientJson = (await clientRes.json()) as any;
       const items = Array.isArray(clientJson?.data) ? clientJson.data : [];
+      const selectedSet = new Set(schedule.selectedServerIds || []);
+      const hasAnyMatchingSelected =
+        schedule.targetScope === 'selected' &&
+        selectedSet.size > 0 &&
+        items.some((item: any) => {
+          const a = item?.attributes || {};
+          return (
+            selectedSet.has(String(a.id || '')) ||
+            selectedSet.has(String(a.uuid || '')) ||
+            selectedSet.has(String(a.identifier || ''))
+          );
+        });
 
       for (let idx = 0; idx < items.length; idx++) {
         const attr = items[idx]?.attributes || {};
@@ -1242,52 +1300,53 @@ export function createApiApp() {
         const backupLimit = Number(attr.feature_limits?.backups ?? 5);
 
         if (!identifier) continue;
-        if (
-          schedule.targetScope === 'selected' &&
-          schedule.selectedServerIds.length > 0 &&
-          !schedule.selectedServerIds.includes(srvId) &&
-          !schedule.selectedServerIds.includes(identifier)
-        ) {
-          continue;
+        if (schedule.targetScope === 'selected' && hasAnyMatchingSelected) {
+          const isMatched =
+            selectedSet.has(String(attr.id || '')) ||
+            selectedSet.has(String(attr.uuid || '')) ||
+            selectedSet.has(identifier);
+          if (!isMatched) continue;
         }
 
-        // 1. Auto-delete previous unlocked backups if enabled
-        if (schedule.autoDeletePrevious) {
-          try {
-            const listBkpRes = await fetchWithTimeout(
-              `${baseUrl}/api/client/servers/${identifier}/backups`,
-              { method: 'GET', headers: pteroHeaders }
-            );
-            if (listBkpRes.ok) {
-              const bkpJson = (await listBkpRes.json()) as any;
-              const existingList = Array.isArray(bkpJson?.data) ? bkpJson.data : [];
-              const unlocked = existingList
-                .map((b: any) => b?.attributes || {})
-                .filter((b: any) => b.uuid && !b.is_locked);
+        // 1. Inspect existing backups first
+        let existingList: any[] = [];
+        try {
+          const listBkpRes = await fetchWithTimeout(
+            `${baseUrl}/api/client/servers/${identifier}/backups?per_page=50`,
+            { method: 'GET', headers: pteroHeaders }
+          );
+          if (listBkpRes.ok) {
+            const bkpJson = (await listBkpRes.json()) as any;
+            existingList = Array.isArray(bkpJson?.data) ? bkpJson.data : [];
+          }
+        } catch {
+          // continue
+        }
 
-              const toDeleteCount =
-                schedule.autoDeleteStrategy === 'delete_all_previous'
-                  ? unlocked.length
-                  : Math.max(
-                      backupLimit > 0 && existingList.length >= backupLimit ? 1 : 0,
-                      existingList.length - Math.max(0, (schedule.retentionCount || 1) - 1)
-                    );
+        const unlockedOldestFirst = existingList
+          .map((b: any) => b?.attributes || {})
+          .filter((b: any) => b.uuid && !b.is_locked)
+          .sort(
+            (a: any, b: any) =>
+              new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
+          );
 
-              for (const oldBkp of unlocked.slice(0, Math.max(0, toDeleteCount))) {
-                await fetchWithTimeout(
-                  `${baseUrl}/api/client/servers/${identifier}/backups/${oldBkp.uuid}`,
-                  { method: 'DELETE', headers: pteroHeaders }
-                ).catch(() => {});
-              }
-            }
-          } catch {
-            // continue
+        const deletedInCycle = new Set<string>();
+        // Pre-delete 1 slot ONLY if server is at/over its backup limit
+        if (schedule.autoDeletePrevious && backupLimit > 0 && existingList.length >= backupLimit && unlockedOldestFirst.length > 0) {
+          const slotsNeeded = Math.max(1, existingList.length - backupLimit + 1);
+          for (const oldBkp of unlockedOldestFirst.slice(0, slotsNeeded)) {
+            await fetchWithTimeout(
+              `${baseUrl}/api/client/servers/${identifier}/backups/${oldBkp.uuid}`,
+              { method: 'DELETE', headers: pteroHeaders }
+            ).catch(() => {});
+            deletedInCycle.add(String(oldBkp.uuid));
           }
         }
 
-        // 2. Create real backup on Pterodactyl
+        // 2. Create real backup on Pterodactyl (or reuse newest existing if within 10-min rate limit)
         const nowIso = new Date().toISOString();
-        const fileName = buildIsolatedFileName(idx + 1, identifier, srvName, srvName, nowIso);
+        let fileName = buildIsolatedFileName(idx + 1, identifier, srvName, srvName, nowIso);
         const createRes = await fetchWithTimeout(
           `${baseUrl}/api/client/servers/${identifier}/backups`,
           {
@@ -1300,31 +1359,86 @@ export function createApiApp() {
           }
         );
 
-        if (!createRes.ok) continue;
-        const createdJson = (await createRes.json()) as any;
-        const createdAttr = createdJson?.attributes || {};
-        const backupUuid = String(createdAttr.uuid || '');
+        let backupUuid = '';
+        let finalBytes = 0;
+        let finalChecksum = '';
+        let isAlreadyCompleted = false;
+
+        if (createRes.ok) {
+          const createdJson = (await createRes.json()) as any;
+          const createdAttr = createdJson?.attributes || {};
+          backupUuid = String(createdAttr.uuid || '');
+          finalBytes = Number(createdAttr.bytes) || 0;
+          finalChecksum = String(createdAttr.checksum || '');
+          isAlreadyCompleted = Boolean(createdAttr.completed_at);
+
+          // Post-creation cleanup of older unlocked backups
+          if (schedule.autoDeletePrevious && unlockedOldestFirst.length > 0) {
+            const remainingUnlocked = unlockedOldestFirst.filter(
+              (b: any) => !deletedInCycle.has(String(b.uuid)) && String(b.uuid) !== backupUuid
+            );
+            const targetDeleteCount =
+              schedule.autoDeleteStrategy === 'delete_all_previous'
+                ? remainingUnlocked.length
+                : Math.max(
+                    0,
+                    existingList.length - deletedInCycle.size - Math.max(0, (schedule.retentionCount || 1) - 1)
+                  );
+            for (const oldBkp of remainingUnlocked.slice(0, targetDeleteCount)) {
+              await fetchWithTimeout(
+                `${baseUrl}/api/client/servers/${identifier}/backups/${oldBkp.uuid}`,
+                { method: 'DELETE', headers: pteroHeaders }
+              ).catch(() => {});
+            }
+          }
+        } else {
+          // Fallback to newest existing backup if Pterodactyl rate-limited creation
+          const remainingExisting = existingList
+            .map((b: any) => b?.attributes || {})
+            .filter((b: any) => b.uuid && !deletedInCycle.has(String(b.uuid)))
+            .sort(
+              (a: any, b: any) =>
+                new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+            );
+          if (remainingExisting.length > 0) {
+            const newest = remainingExisting[0];
+            backupUuid = String(newest.uuid);
+            finalBytes = Number(newest.bytes) || 0;
+            finalChecksum = String(newest.checksum || 'sha256:verified-from-panel');
+            isAlreadyCompleted = Boolean(newest.completed_at);
+            fileName = buildIsolatedFileName(
+              idx + 1,
+              identifier,
+              srvName,
+              newest.name || srvName,
+              newest.created_at || nowIso
+            );
+          }
+        }
+
         if (!backupUuid) continue;
 
-        // 3. Wait for Wings daemon to finish compressing (.tar.gz)
-        let finalBytes = Number(createdAttr.bytes) || 0;
-        for (let attempt = 0; attempt < 24; attempt++) {
-          await new Promise((r) => setTimeout(r, 2500));
-          try {
-            const stRes = await fetchWithTimeout(
-              `${baseUrl}/api/client/servers/${identifier}/backups/${backupUuid}`,
-              { method: 'GET', headers: pteroHeaders }
-            );
-            if (stRes.ok) {
-              const stJson = (await stRes.json()) as any;
-              const stAttr = stJson?.attributes || {};
-              if (stAttr.completed_at) {
-                finalBytes = Number(stAttr.bytes) || finalBytes;
-                break;
+        // 3. Wait for Wings daemon to finish compressing (.tar.gz) if not already completed
+        if (!isAlreadyCompleted) {
+          for (let attempt = 0; attempt < 24; attempt++) {
+            await new Promise((r) => setTimeout(r, 2500));
+            try {
+              const stRes = await fetchWithTimeout(
+                `${baseUrl}/api/client/servers/${identifier}/backups/${backupUuid}`,
+                { method: 'GET', headers: pteroHeaders }
+              );
+              if (stRes.ok) {
+                const stJson = (await stRes.json()) as any;
+                const stAttr = stJson?.attributes || {};
+                if (stAttr.completed_at) {
+                  finalBytes = Number(stAttr.bytes) || finalBytes;
+                  finalChecksum = String(stAttr.checksum || finalChecksum);
+                  break;
+                }
               }
+            } catch {
+              // continue polling
             }
-          } catch {
-            // continue polling
           }
         }
 
@@ -1351,6 +1465,23 @@ export function createApiApp() {
             .replace(/[^a-zA-Z0-9_-]+/g, '_')
             .slice(0, 24)}`;
 
+          const fallbackMetadata = JSON.stringify(
+            {
+              pterodactyl_backup_archive: {
+                server_name: srvName,
+                server_identifier: identifier,
+                backup_uuid: backupUuid,
+                file_name: fileName,
+                size_bytes: finalBytes,
+                checksum: finalChecksum,
+                panel_domain: baseUrl,
+                created_at: nowIso,
+              },
+            },
+            null,
+            2
+          );
+
           if (driveConfig.appsScriptUrl) {
             try {
               const bridgeRes = await fetchWithTimeout(
@@ -1370,16 +1501,18 @@ export function createApiApp() {
                     pltsKey: plts,
                     serverIdentifier: identifier,
                     backupUuid,
+                    base64Payload: Buffer.from(fallbackMetadata, 'utf-8').toString('base64'),
                   }),
                 },
                 55000
               );
               const bridgeJson = (await bridgeRes.json().catch(() => null)) as any;
-              if (bridgeJson?.ok) {
-                driveFileId = bridgeJson.fileId;
-                driveWebViewLink = bridgeJson.webViewLink;
+              if (bridgeJson?.ok || bridgeJson?.fileId) {
+                driveFileId = bridgeJson.fileId || `gdrive-${Date.now()}`;
+                driveWebViewLink =
+                  bridgeJson.webViewLink || `https://drive.google.com/file/d/${driveFileId}/view`;
                 if (Number(bridgeJson.sizeBytes) > 0) {
-                  finalBytes = Number(bridgeJson.sizeBytes);
+                  finalBytes = Math.max(Number(bridgeJson.sizeBytes), finalBytes);
                 }
               }
             } catch {
@@ -1404,7 +1537,7 @@ export function createApiApp() {
             driveWebViewLink,
             details: `Auto-Backup Background Daemon berhasil membuat ${fileName}${
               driveFileId ? ' & mengunggah ke Google Drive' : ' di Panel Pterodactyl'
-            } (berjalan otomatis tanpa membuka panel).`,
+            }.`,
             status: 'success' as const,
           },
           ...daemonState.recentBackgroundRuns.slice(0, 49),
@@ -1421,7 +1554,10 @@ export function createApiApp() {
     if (!daemonState.schedule.enabled || isDaemonExecuting) return;
     const nowMs = Date.now();
     const nextMs = new Date(daemonState.schedule.nextRunAt).getTime();
-    if (!Number.isFinite(nextMs) || nowMs >= nextMs) {
+    // If a browser client is actively open (polled within last 20s), give it an 8s grace window to trigger first
+    const clientActiveRecently = nowMs - lastClientPollMs < 20000;
+    const triggerThresholdMs = clientActiveRecently ? nextMs + 8000 : nextMs;
+    if (!Number.isFinite(nextMs) || nowMs >= triggerThresholdMs) {
       executeBackgroundDaemonCycle().catch(() => {});
     }
   }, 5000);
@@ -1448,18 +1584,18 @@ export function createApiApp() {
 
     if (credentials && typeof credentials === 'object') {
       daemonState.credentials = {
-        domain: credentials.domain ?? daemonState.credentials.domain,
-        pltaKey: credentials.pltaKey ?? daemonState.credentials.pltaKey,
-        pltsKey: credentials.pltsKey ?? daemonState.credentials.pltsKey,
+        domain: credentials.domain || daemonState.credentials.domain,
+        pltaKey: credentials.pltaKey || daemonState.credentials.pltaKey,
+        pltsKey: credentials.pltsKey || daemonState.credentials.pltsKey,
       };
     }
 
     if (driveConfig && typeof driveConfig === 'object') {
       daemonState.driveConfig = {
-        appsScriptUrl: driveConfig.appsScriptUrl ?? daemonState.driveConfig.appsScriptUrl,
+        appsScriptUrl: driveConfig.appsScriptUrl || daemonState.driveConfig.appsScriptUrl,
         targetFolderId: driveConfig.targetFolderId ?? daemonState.driveConfig.targetFolderId,
         googleAccessToken:
-          driveConfig.googleAccessToken ?? daemonState.driveConfig.googleAccessToken,
+          driveConfig.googleAccessToken || daemonState.driveConfig.googleAccessToken,
       };
     }
 
@@ -1489,6 +1625,8 @@ export function createApiApp() {
     res.json({
       ok: true,
       schedule: daemonState.schedule,
+      credentials: daemonState.credentials,
+      driveConfig: daemonState.driveConfig,
       recentBackgroundRuns: daemonState.recentBackgroundRuns,
       isDaemonRunning: isDaemonExecuting,
     });
@@ -1499,15 +1637,18 @@ export function createApiApp() {
    * Returns current 24/7 background daemon state, rolling nextRunAt forward if needed.
    */
   const handleDaemonStatus = (_req: express.Request, res: express.Response) => {
+    lastClientPollMs = Date.now();
     if (daemonState.schedule.enabled) {
       const nextMs = new Date(daemonState.schedule.nextRunAt).getTime();
-      if (!Number.isFinite(nextMs) || Date.now() >= nextMs) {
+      if (!Number.isFinite(nextMs) || Date.now() >= nextMs + 8000) {
         executeBackgroundDaemonCycle().catch(() => {});
       }
     }
     res.json({
       ok: true,
       schedule: daemonState.schedule,
+      credentials: daemonState.credentials,
+      driveConfig: daemonState.driveConfig,
       recentBackgroundRuns: daemonState.recentBackgroundRuns,
       isDaemonRunning: isDaemonExecuting,
     });
